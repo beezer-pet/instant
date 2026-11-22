@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// Turns every built package in client/packages into its @liminis build, ready
+// Turns every built package in client/packages into its @beezer-pet build, ready
 // for `pnpm pack`. Run it after `pnpm run build-packages`; it rewrites each
 // package's package.json and README in place.
 //
-//   node scripts/liminis/prepare-release.mjs 1.0.67-lm.2
+//   node scripts/beezer/prepare-release.mjs 1.0.67-beezer.2
 //
-// Naming: @instantdb/<x> -> @liminis/instant-<x>, instant-cli ->
-// @liminis/instant-cli, create-instant-app -> @liminis/create-instant-app.
+// Naming: @instantdb/<x> -> @beezer-pet/instant-<x>, instant-cli ->
+// @beezer-pet/instant-cli, create-instant-app -> @beezer-pet/create-instant-app.
 //
 // Every dependency on another package in this workspace becomes an npm alias
 // to our build at the same version, under the upstream name:
 //
-//   "@instantdb/core": "npm:@liminis/instant-core@1.0.67-lm.2"
+//   "@instantdb/core": "npm:@beezer-pet/instant-core@1.0.67-beezer.2"
 //
 // so the source keeps importing `@instantdb/*`, and installing any one of our
 // packages brings in only our builds of the others. An app switches by
@@ -19,9 +19,9 @@
 //
 // The version the client reports to the server stays upstream's (`v1.0.67`
 // in packages/version). The server enables protocol features by parsing it,
-// and it only accepts plain semver, so a `-lm.N` there would turn them off.
+// and it only accepts plain semver, so a `-beezer.N` there would turn them off.
 //
-// Writes scripts/liminis/release-manifest.json: the packages in the order to
+// Writes scripts/beezer/release-manifest.json: the packages in the order to
 // publish them, dependencies first.
 
 import {
@@ -37,8 +37,8 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const client = join(here, '..', '..');
 const repoRoot = join(client, '..');
-const repo = 'https://github.com/liminisapp/instantdb';
-const branch = 'self-hosted-patches';
+const repo = 'https://github.com/beezer-pet/instant';
+const branch = 'self-hosted';
 
 const version = process.argv[2];
 const base = readFileSync(
@@ -49,20 +49,20 @@ if (!base) {
   throw new Error('no upstream version in packages/version/src/version.ts');
 }
 if (
-  !new RegExp(`^${base.replaceAll('.', '\\.')}-lm\\.\\d+$`).test(version ?? '')
+  !new RegExp(`^${base.replaceAll('.', '\\.')}-beezer\\.\\d+$`).test(version ?? '')
 ) {
   throw new Error(
-    `version must be ${base}-lm.N, the upstream version this branch is on; got ${version}`,
+    `version must be ${base}-beezer.N, the upstream version this branch is on; got ${version}`,
   );
 }
 
 export function forkName(upstream) {
   if (upstream.startsWith('@instantdb/')) {
-    return `@liminis/instant-${upstream.slice('@instantdb/'.length)}`;
+    return `@beezer-pet/instant-${upstream.slice('@instantdb/'.length)}`;
   }
-  if (upstream === 'instant-cli') return '@liminis/instant-cli';
-  if (upstream === 'create-instant-app') return '@liminis/create-instant-app';
-  throw new Error(`no @liminis name for ${upstream}; add one to forkName`);
+  if (upstream === 'instant-cli') return '@beezer-pet/instant-cli';
+  if (upstream === 'create-instant-app') return '@beezer-pet/create-instant-app';
+  throw new Error(`no @beezer-pet name for ${upstream}; add one to forkName`);
 }
 
 const aliasTo = (upstream) => `npm:${forkName(upstream)}@${version}`;
@@ -83,7 +83,7 @@ const packages = readdirSync(packagesDir, { withFileTypes: true })
 
 const workspaceNames = new Set(packages.map(({ pkg }) => pkg.name));
 for (const { pkg } of packages) {
-  if (pkg.name.startsWith('@liminis/')) {
+  if (pkg.name.startsWith('@beezer-pet/')) {
     throw new Error(`${pkg.name} is already prepared; run on a fresh build`);
   }
   forkName(pkg.name); // every package must have a fork name
@@ -137,7 +137,7 @@ const builtVersion = readdirSync(join(client, 'packages/version/dist'), {
   .filter((f) => /\.(c|m)?js$/.test(f))
   .map((f) => readFileSync(join(client, 'packages/version/dist', f), 'utf8'))
   .join('\n');
-if (!builtVersion.includes(`v${base}`) || builtVersion.includes('-lm.')) {
+if (!builtVersion.includes(`v${base}`) || builtVersion.includes('-beezer.')) {
   throw new Error(
     `packages/version/dist must report v${base} to the server; build it from an unmodified version.ts`,
   );
@@ -147,15 +147,15 @@ if (!builtVersion.includes(`v${base}`) || builtVersion.includes('-lm.')) {
 
 const readme = (upstream, name) => `# ${name}
 
-The [liminisapp/instantdb](${repo}) build of
+The [beezer-pet/instant](${repo}) build of
 [\`${upstream}\`](https://www.npmjs.com/package/${upstream}). It is maintained by
-Liminis and **is not published or supported by the Instant team**.
+Beezer and **is not published or supported by the Instant team**.
 
-liminisapp/instantdb is a maintained fork of
+beezer-pet/instant is a maintained fork of
 [Instant](https://github.com/instantdb/instant): its server and its client
 packages are released together, from the same commit, at the same version.
 Version ${version} is upstream ${base} plus the fork's fixes; see the
-[release notes](${repo}/releases/tag/lm-v${version}).
+[release notes](${repo}/releases/tag/v${version}).
 
 ## Using it
 
@@ -191,7 +191,7 @@ for (const { dir, file, pkg } of packages) {
   Object.assign(pkg, {
     name,
     version,
-    description: `The liminisapp/instantdb build of ${upstream}. Not published by Instant.`,
+    description: `The beezer-pet/instant build of ${upstream}. Not published by Instant.`,
     homepage: `${repo}/tree/${branch}/${rel}`,
     repository: { type: 'git', url: `git+${repo}.git`, directory: rel },
     bugs: { url: `${repo}/issues` },
