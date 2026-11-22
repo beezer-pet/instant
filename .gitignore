@@ -237,9 +237,7 @@ client/packages/version/src/package.json
 .codex
 
 # LLM rules (these are ignored so you can customize them, but to set up our defaults, run `make setup-dev-llm-rules`)
-/CLAUDE.md
 /AGENTS.md
-/*/CLAUDE.md
 /*/AGENTS.md
 
 # example project package-locks
