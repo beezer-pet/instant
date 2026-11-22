@@ -5,10 +5,10 @@ import { packageDirectorySync } from 'package-directory';
 
 type OwnPackage = { name?: string; version?: string };
 
-// The fork's packages are published as `@liminis/instant-<dir>`, from the same
+// The fork's packages are published as `@beezer-pet/instant-<dir>`, from the same
 // source as `@instantdb/<dir>`.
-const FORK_SCOPE = '@liminis/';
-const FORK_PREFIX = '@liminis/instant-';
+const FORK_SCOPE = '@beezer-pet/';
+const FORK_PREFIX = '@beezer-pet/instant-';
 
 function readOwnPackage(): OwnPackage {
   try {
