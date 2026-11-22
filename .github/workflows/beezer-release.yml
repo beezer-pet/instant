@@ -1,31 +1,31 @@
-# Releases liminisapp/instantdb: the server and dashboard images and every client
+# Releases beezer-pet/instant: the server and dashboard images and every client
 # package, built from one commit at one version.
 #
-# Release by pushing a tag `lm-v<version>` on a self-hosted-patches commit, e.g.
-# `lm-v1.0.67-lm.2`. The version must be the upstream version in
-# client/packages/version/src/version.ts plus `-lm.N`.
+# Release by pushing a tag `v<version>` on a self-hosted commit, e.g.
+# `v1.0.67-beezer.2`. The version must be the upstream version in
+# client/packages/version/src/version.ts plus `-beezer.N`.
 #
-#   images    ghcr.io/liminisapp/instant-server:<version>, :latest
-#             ghcr.io/liminisapp/instant-dashboard:<version>, :latest
-#   npm       @liminis/instant-* (all of client/packages), see
-#             client/scripts/liminis/prepare-release.mjs
+#   images    ghcr.io/beezer-pet/instant-server:<version>, :latest
+#             ghcr.io/beezer-pet/instant-dashboard:<version>, :latest
+#   npm       @beezer-pet/instant-* (all of client/packages), see
+#             client/scripts/beezer/prepare-release.mjs
 #   release   a GitHub release with the commits since upstream and the tarballs
 #
-# npm publishing only runs when the repository variable LIMINIS_NPM_PUBLISH is
+# npm publishing only runs when the repository variable BEEZER_NPM_PUBLISH is
 # `true`. It uses the secret NPM_TOKEN if it is set, which is only for the first
 # release, before the packages exist and trusted publishing can be configured
 # for them. Without it, publishing uses OIDC trusted publishing. Versions that
 # are already on npm are skipped, so a failed run can be re-run.
 
-name: liminis release
+name: Beezer release
 
 on:
   push:
     tags:
-      - "lm-v*"
+      - "v*-beezer.*"
 
 concurrency:
-  group: liminis-release
+  group: beezer-release
   cancel-in-progress: false
 
 jobs:
@@ -47,15 +47,15 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          version="${TAG#lm-v}"
+          version="${TAG#v}"
           base=$(sed -n "s/^const version = 'v\([0-9.]*\)';$/\1/p" client/packages/version/src/version.ts)
-          if [[ ! "$version" =~ ^${base//./\\.}-lm\.[0-9]+$ ]]; then
-            echo "::error::$TAG must be lm-v${base}-lm.N, the upstream version this commit is on"
+          if [[ ! "$version" =~ ^${base//./\\.}-beezer\.[0-9]+$ ]]; then
+            echo "::error::$TAG must be v${base}-beezer.N, the upstream version this commit is on"
             exit 1
           fi
-          git fetch origin self-hosted-patches
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/self-hosted-patches; then
-            echo "::error::$TAG is not on self-hosted-patches"
+          git fetch origin self-hosted
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/self-hosted; then
+            echo "::error::$TAG is not on self-hosted"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -100,17 +100,17 @@ jobs:
 
       - name: Prepare the packages
         working-directory: client
-        run: node scripts/liminis/prepare-release.mjs "${{ needs.version.outputs.version }}"
+        run: node scripts/beezer/prepare-release.mjs "${{ needs.version.outputs.version }}"
 
       - name: Pack
         working-directory: client
         run: |
           out="$RUNNER_TEMP/packages"
           mkdir -p "$out"
-          for dir in $(jq -r '.packages[].dir' scripts/liminis/release-manifest.json); do
+          for dir in $(jq -r '.packages[].dir' scripts/beezer/release-manifest.json); do
             (cd "$GITHUB_WORKSPACE/$dir" && pnpm pack --pack-destination "$out")
           done
-          cp scripts/liminis/release-manifest.json "$out/"
+          cp scripts/beezer/release-manifest.json "$out/"
           ls -l "$out"
 
       - uses: actions/upload-artifact@v4
@@ -157,7 +157,7 @@ jobs:
             platform_tag: arm64
             runner: ubuntu-24.04-arm
     env:
-      IMAGE: ghcr.io/liminisapp/instant-${{ matrix.image_name }}
+      IMAGE: ghcr.io/beezer-pet/instant-${{ matrix.image_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -181,7 +181,7 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:${{ needs.version.outputs.version }}-${{ matrix.platform_tag }}
           labels: |
-            org.opencontainers.image.source=https://github.com/liminisapp/instantdb
+            org.opencontainers.image.source=https://github.com/beezer-pet/instant
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
@@ -199,7 +199,7 @@ jobs:
       matrix:
         image_name: [server, dashboard]
     env:
-      IMAGE: ghcr.io/liminisapp/instant-${{ matrix.image_name }}
+      IMAGE: ghcr.io/beezer-pet/instant-${{ matrix.image_name }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - name: Set up Docker Buildx
@@ -221,7 +221,7 @@ jobs:
   npm:
     name: Publish to npm
     needs: [version, packages, images-manifest]
-    if: vars.LIMINIS_NPM_PUBLISH == 'true'
+    if: vars.BEEZER_NPM_PUBLISH == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -279,6 +279,7 @@ jobs:
       - name: Write the release notes
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          NPM_PUBLISH: ${{ vars.BEEZER_NPM_PUBLISH }}
         run: |
           base=$(jq -r .base packages/release-manifest.json)
           # Upstream's main, or our copy of it if upstream is gone.
@@ -289,13 +290,21 @@ jobs:
             echo "Upstream $base (\`${from:0:8}\`) plus the commits below."
             echo
             echo "**Images**"
-            echo "- \`ghcr.io/liminisapp/instant-server:$VERSION\`"
-            echo "- \`ghcr.io/liminisapp/instant-dashboard:$VERSION\`"
+            echo "- \`ghcr.io/beezer-pet/instant-server:$VERSION\`"
+            echo "- \`ghcr.io/beezer-pet/instant-dashboard:$VERSION\`"
             echo
-            echo "**npm** — install each \`@instantdb/*\` package your app uses as an alias, pinned exactly:"
-            echo '```sh'
-            echo "npm install --save-exact @instantdb/react@npm:@liminis/instant-react@$VERSION"
-            echo '```'
+            if [ "$NPM_PUBLISH" = true ]; then
+              echo "**npm**"
+              echo
+              echo "Install each \`@instantdb/*\` package your app uses as an alias, pinned exactly:"
+              echo '```sh'
+              echo "npm install --save-exact @instantdb/react@npm:@beezer-pet/instant-react@$VERSION"
+              echo '```'
+            else
+              echo "**Client packages**"
+              echo
+              echo "Attached below as tarballs, not published to npm."
+            fi
             echo
             echo "**Changes from upstream**"
             git log --reverse --format='- %s (%h)' "$from..HEAD"
