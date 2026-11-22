@@ -5824,6 +5824,70 @@
             (testing "connection did not deadlock"
               (is @tx))))))))
 
+(deftest deadlocked-transaction-runs-again
+  (with-zeneca-app
+    (fn [{app-id :id make-ctx :make-ctx} r]
+      (with-open [other (next.jdbc/get-connection (config/get-aurora-config))]
+        (let [id-aid (resolvers/->uuid r :users/id)
+              handle-aid (resolvers/->uuid r :users/handle)
+              transact-impl! tx/transact-without-tx-conn-impl!
+              attempts (atom 0)
+              other-waits (atom nil)
+              ;; Deadlocks the transaction on `conn` with the session on
+              ;; `other`. Each side checks for a deadlock once, when its wait
+              ;; reaches `deadlock_timeout` (1 s), and the side whose check
+              ;; finds the cycle is aborted: `other` waits 250 ms after `conn`,
+              ;; so that `conn` checks first and the cycle is complete then.
+              deadlock! (fn [conn]
+                          (some-> @other-waits deref)
+                          (let [k1 (rand-int Integer/MAX_VALUE)
+                                k2 (rand-int Integer/MAX_VALUE)]
+                            (sql/execute! other ["select pg_advisory_lock(?)" k2])
+                            (sql/execute! conn ["select pg_advisory_xact_lock(?)" k1])
+                            (reset! other-waits
+                                    (future
+                                      (test-util/wait-for
+                                       #(seq (sql/select (aurora/conn-pool :read)
+                                                         ["select 1 from pg_locks
+                                                            where locktype = 'advisory'
+                                                              and objid = ?
+                                                              and not granted"
+                                                          k2]))
+                                       5000
+                                       10)
+                                      (Thread/sleep 250)
+                                      (sql/execute! other ["select pg_advisory_lock(?)" k1])))
+                            (sql/execute! conn ["select pg_advisory_xact_lock(?)" k2])))
+              transact! (fn [eid deadlocks]
+                          (reset! attempts 0)
+                          (with-redefs [tx/transact-without-tx-conn-impl!
+                                        (fn [conn & args]
+                                          (let [res (apply transact-impl! conn args)]
+                                            (when (<= (swap! attempts inc) deadlocks)
+                                              (deadlock! conn))
+                                            res))]
+                            (try
+                              (permissioned-tx/transact!
+                               (make-ctx)
+                               [[:add-triple eid id-aid eid]
+                                [:add-triple eid handle-aid (str eid)]])
+                              (finally
+                                (some-> @other-waits deref)))))
+              stored? (fn [eid]
+                        (seq (fetch-triples app-id [[:= :entity-id eid]])))]
+          (testing "a transaction that Postgres aborts to break a deadlock runs again"
+            (let [eid (random-uuid)]
+              (is (transact! eid 1))
+              (is (= 2 @attempts))
+              (is (stored? eid))))
+          (testing "a transaction that keeps deadlocking fails"
+            (with-redefs [permissioned-tx/max-deadlock-retries 1]
+              (let [eid (random-uuid)
+                    ex-data (test-util/instant-ex-data (transact! eid 2))]
+                (is (= :deadlock-detected (-> ex-data ::ex/hint :condition)))
+                (is (= 2 @attempts))
+                (is (not (stored? eid)))))))))))
+
 ;; Test that we don't get a conflict if a bunch of lookup inserts are happening simultaneously
 (deftest multiple-lookups-work
   (with-zeneca-app

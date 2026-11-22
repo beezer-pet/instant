@@ -638,7 +638,7 @@
               :check-result result
               :check-pass?  (boolean result))))))))
 
-(defn transact!
+(defn- transact-once!
   "Runs transactions alongside permission checks. The overall flow looks like this:
 
    1. Take a list of tx-steps (add-attr, delete-attr, add-triple, etc)
@@ -749,6 +749,28 @@
                      :check-results  check-results
                      :all-checks-ok? all-checks-ok?
                      :committed?     (not rollback?)))))))))
+
+(def max-deadlock-retries 3)
+
+(defn- deadlock? [e]
+  (= :deadlock-detected
+     (some-> (ex/find-instant-exception e) ex-data ::ex/hint :condition)))
+
+(defn transact!
+  "Runs `transact-once!`, and runs it again if Postgres aborts it to break a
+   deadlock. Nothing of an aborted transaction is stored."
+  [ctx tx-step-vecs]
+  (loop [retries 0]
+    (let [res (try
+                (transact-once! ctx tx-step-vecs)
+                (catch Exception e
+                  (if (and (< retries max-deadlock-retries)
+                           (deadlock? e))
+                    ::deadlock
+                    (throw e))))]
+      (if (= ::deadlock res)
+        (recur (inc retries))
+        res))))
 
 (comment
   (do
