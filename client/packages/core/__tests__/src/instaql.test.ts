@@ -1263,6 +1263,43 @@ test('$not and $ne', () => {
   expect(query(newCtx, qNe).data.tests.map((x) => x.val)).toEqual(expected);
 });
 
+test('every operator of a clause applies through a link', () => {
+  function handles(where) {
+    const res = query(ctx, { users: { $: { where } } });
+    return res.data.users.map((x) => x.handle);
+  }
+  const title = 'bookshelves.books.title';
+  const alex = { handle: 'alex' };
+
+  // To one linked record
+  expect(handles({ ...alex, [title]: { $gt: 'D' } })).toEqual(['alex']);
+  expect(handles({ ...alex, [title]: { $lt: 'R' } })).toEqual(['alex']);
+  expect(handles({ ...alex, [title]: { $gt: 'D', $lt: 'R' } })).toEqual([]);
+
+  // In whatever order they are written
+  for (const order of [
+    { $gte: 1, $lte: 99 },
+    { $lte: 99, $gte: 1 },
+  ]) {
+    const shelf = { ...alex, 'bookshelves.order': order };
+    expect(handles({ ...shelf, 'bookshelves.name': 'Nonfiction' })).toEqual([
+      'alex',
+    ]);
+    expect(handles({ ...shelf, 'bookshelves.name': 'Short Stories' })).toEqual(
+      [],
+    );
+    expect(
+      handles({ ...shelf, 'bookshelves.name': { $not: 'Nonfiction' } }),
+    ).toEqual(
+      handles({
+        ...alex,
+        'bookshelves.order': { $gte: 1 },
+        'bookshelves.name': { $not: 'Nonfiction' },
+      }),
+    );
+  }
+});
+
 test('comparators', () => {
   const schema = i.schema({
     entities: {
@@ -1327,6 +1364,45 @@ test('comparators', () => {
   expect(
     runQuery('date', '$gt', JSON.parse(JSON.stringify(new Date()))),
   ).toEqual([]);
+
+  function runWhere(dataType, where) {
+    const res = query(newCtx, { tests: { $: { where } } });
+    return res.data.tests.map((x) => x[dataType]);
+  }
+
+  // Every operator of a clause applies
+  expect(runWhere('number', { number: { $gte: 1, $lte: 3 } })).toEqual([
+    1, 2, 3,
+  ]);
+  expect(runWhere('number', { number: { $lte: 3, $gte: 1 } })).toEqual([
+    1, 2, 3,
+  ]);
+  expect(runWhere('string', { string: { $gt: '1', $lt: '3' } })).toEqual(['2']);
+  expect(runWhere('date', { date: { $gt: 1, $lt: 4 } })).toEqual([2, 3]);
+  expect(runWhere('number', { number: { $gte: 1, $lte: 3, $not: 2 } })).toEqual(
+    [1, 3],
+  );
+  expect(runWhere('number', { number: { $in: [0, 2, 3], $gt: 1 } })).toEqual([
+    2, 3,
+  ]);
+  expect(
+    runWhere('number', {
+      or: [{ number: 0 }, { number: { $gte: 2, $lt: 4 } }],
+    }),
+  ).toEqual([0, 2, 3]);
+  expect(
+    runWhere('number', { number: { in: [1, 2, 3], $in: [2, 3, 4] } }),
+  ).toEqual([2, 3]);
+  expect(runWhere('number', { number: { $not: 1, $ne: 2 } })).toEqual([
+    0, 3, 4,
+  ]);
+  expect(runWhere('number', { number: { $isNull: false, $gt: 2 } })).toEqual([
+    3, 4,
+  ]);
+  // The server is never sent an operator whose value is undefined
+  expect(runWhere('number', { number: { $gte: 3, $lte: undefined } })).toEqual([
+    3, 4,
+  ]);
 
   expect(runQuery('boolean', '$gt', true)).toEqual([]);
   expect(runQuery('boolean', '$gte', true)).toEqual([true, true, true]);
