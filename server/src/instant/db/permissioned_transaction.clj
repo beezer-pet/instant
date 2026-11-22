@@ -11,6 +11,7 @@
    [instant.model.rule :as rule-model]
    [instant.util.exception :as ex]
    [instant.util.io :as io]
+   [instant.util.json :refer [->json]]
    [instant.util.string :as string-util]
    [instant.util.tracer :as tracer]
    [instant.util.uuid :as uuid-util]
@@ -232,42 +233,75 @@
     updates))
 
 (defn update-entities-map
-  "Applies local tx-steps to entities in entities-map, producing entities
-   ~approximating ones post tx"
+  "Applies tx-steps to the entities in entities-map. Given the steps in the
+   order the database applies them, returns
+
+     {:entities <the entities ~approximating the ones post tx>
+      :cleared  #{[eid aid]}, the attributes with one value whose value a
+                retract removes}
+
+   As in the database, a retract removes a value only where it names the
+   value that is held. Of an attribute with many values an entity holds the
+   last value that the transaction adds and doesn't retract afterwards."
   [{:keys [attrs]} entities-map tx-steps]
-  (persistent!
-   (reduce
-    (fn [acc {:keys [op eid etype aid value]}]
-      (let [key   {:eid eid :etype etype}
-            ;; apply lookup from eid as entity attr
-            acc'  (if (and (lookup-ref? eid)
-                           (#{:add-triple :deep-merge-triple} op))
-                    (let [[lookup-aid lookup-value] eid
-                          lookup-label (-> lookup-aid
-                                           (attr-model/seek-by-id attrs)
-                                           :forward-identity
-                                           last)]
-                      (ucoll/update! acc key assoc lookup-label lookup-value))
-                    acc)
-            ;; apply tx-step
-            label (some-> aid
-                          (attr-model/seek-by-id attrs)
-                          :forward-identity
-                          last)
-            acc'' (case op
-                    :add-triple
-                    (ucoll/update! acc' key assoc label value)
+  (let [{:keys [entities many cleared]}
+        (reduce
+         (fn [acc {:keys [op eid etype aid value]}]
+           (let [key   {:eid eid :etype etype}
+                 ;; apply lookup from eid as entity attr
+                 acc   (if (and (lookup-ref? eid)
+                                (#{:add-triple :deep-merge-triple} op))
+                         (let [[lookup-aid lookup-value] eid
+                               lookup-label (-> lookup-aid
+                                                (attr-model/seek-by-id attrs)
+                                                :forward-identity
+                                                last)]
+                           (update acc :entities ucoll/update! key assoc lookup-label lookup-value))
+                         acc)
+                 ;; apply tx-step
+                 attr  (some-> aid
+                               (attr-model/seek-by-id attrs))
+                 label (-> attr
+                           :forward-identity
+                           last)
+                 one?  (= :one (:cardinality attr))
+                 ;; the database finds the triple to delete by the value's json
+                 named? (fn [held]
+                          (= (->json held) (->json value)))]
+             (case op
+               :add-triple
+               (if one?
+                 (update acc :entities ucoll/update! key assoc label value)
+                 (update-in acc [:many [key label]] (fnil conj []) value))
 
-                    :deep-merge-triple
-                    (ucoll/update! acc' key update label deep-merge-and-delete value)
+               :deep-merge-triple
+               (update acc :entities ucoll/update! key update label deep-merge-and-delete value)
 
-                    :retract-triple
-                    (ucoll/update! acc' key dissoc label)
+               :retract-triple
+               (if one?
+                 (let [entity (get (:entities acc) key)]
+                   (if (and (contains? entity label)
+                            (named? (get entity label)))
+                     (-> acc
+                         (update :entities ucoll/update! key dissoc label)
+                         (update :cleared conj [(str eid) (str aid)]))
+                     acc))
+                 (update-in acc [:many [key label]] #(into [] (remove named?) %)))
 
-                    acc')]
-        acc''))
-    (transient entities-map)
-    tx-steps)))
+               acc)))
+         {:entities (transient entities-map)
+          :many     {}
+          :cleared  #{}}
+         tx-steps)]
+    {:entities (persistent!
+                (reduce-kv
+                 (fn [entities [key label] values]
+                   (if (seq values)
+                     (ucoll/update! entities key assoc label (peek values))
+                     entities))
+                 entities
+                 many))
+     :cleared  cleared}))
 
 (defn get-modified-fields-for-eid
   "Returns a list of field names being modified for a given entity.
@@ -308,22 +342,59 @@
 
 (defn validate-retracted!
   "A retract is checked through the entity it names, as the entity was before
-   the transaction. One that deleted a triple of an entity that was not there
-   then, other than a triple the transaction wrote itself, was given no
-   check, so the transaction is refused."
-  [ctx entities-map tx-steps tx-data]
-  (let [loaded  (into #{}
-                      (for [[{:keys [eid etype]} entity] entities-map
-                            :when entity]
-                        [(str eid) etype]))
-        written (into #{}
-                      (for [{:keys [op eid aid]} tx-steps
-                            :when (#{:add-triple :deep-merge-triple} op)]
-                        [(str eid) (str aid)]))]
-    (doseq [{:keys [entity_id attr_id]} (get-in tx-data [:results :retract-triple])
+   the transaction, and the rules are given the entity as the retracts are
+   expected to leave it. The transaction is refused where the database did
+   otherwise:
+
+   A retract deleted a triple of an entity that was not there before the
+   transaction, other than a triple the transaction wrote itself, so it was
+   given no check.
+
+   The attributes with one value that lost it to a retract are not the
+   `cleared` ones, for example because the entity was changed after the
+   checks read it, or holds a value in another form than it is read in. A
+   value that a delete of an entity took first is not expected of a retract,
+   unless the transaction writes the attribute between the two."
+  [{:keys [attrs] :as ctx} entities-map cleared tx-steps tx-data]
+  (let [loaded   (into #{}
+                       (for [[{:keys [eid etype]} entity] entities-map
+                             :when entity]
+                         [(str eid) etype]))
+        written  (into #{}
+                       (for [{:keys [op eid aid]} tx-steps
+                             :when (#{:add-triple :deep-merge-triple} op)]
+                         [(str eid) (str aid)]))
+        results  (:results tx-data)
+        removed  (into #{}
+                       (for [{:keys [entity_id attr_id]} (:retract-triple results)
+                             :when (= :one (:cardinality (attr-model/seek-by-id attr_id attrs)))]
+                         [(str entity_id) (str attr_id)]))
+        ;; tx-steps are in the order the database applies them
+        between  (->> tx-steps
+                      (drop-while #(not (#{:delete-entity :retract-triple} (:op %))))
+                      (take-while #(not= :retract-triple (:op %))))
+        deleted  (when (seq between)
+                   (into #{}
+                         (for [{:keys [entity_id attr_id]} (:delete-entity results)]
+                           [(str entity_id) (str attr_id)])))
+        rewritten (into #{}
+                        (for [{:keys [op eid aid]} between
+                              :when (#{:add-triple :deep-merge-triple} op)]
+                          [(str eid) (str aid)]))
+        expected (into #{}
+                       (remove (fn [eid+aid]
+                                 (and (contains? deleted eid+aid)
+                                      (not (rewritten eid+aid)))))
+                       cleared)]
+    (doseq [{:keys [entity_id attr_id]} (:retract-triple results)
             :when (not (or (loaded [(str entity_id) (extract-etype ctx attr_id)])
                            (written [(str entity_id) (str attr_id)])))]
-      (ex/throw-validation-err! :eid entity_id [{:message "Could not find the entity for this retract"}]))))
+      (ex/throw-validation-err! :eid entity_id [{:message "Could not find the entity for this retract"}]))
+    (when-some [[eid aid] (first (concat (remove removed expected)
+                                         (remove expected removed)))]
+      (ex/throw-validation-err! :retract
+                                {:entity-id eid :attr-id aid}
+                                [{:message "The retract did not do what the permission checks expected of it"}]))))
 
 (defn pre-checks
   "Checks that run before tx: update, delete for attrs & objects"
@@ -752,7 +823,12 @@
                   tx-step-maps         (resolve-lookups-tx-steps ctx entities-map tx-step-maps)
                   _                    (validate-retracts! ctx tx-step-maps)
                   entities-map         (resolve-lookups-entities-map ctx entities-map)
-                  updated-entities-map (update-entities-map ctx entities-map tx-step-maps)
+                  ;; the rules are given the entities as the database's order
+                  ;; of the steps leaves them
+                  ordered-tx-step-maps (tx/reorder-tx-steps ops-order tx-step-maps)
+                  {updated-entities-map :entities
+                   cleared              :cleared}
+                  (update-entities-map ctx entities-map ordered-tx-step-maps)
                   rule-params-map      (persistent!
                                         (reduce
                                          (fn [acc {:keys [op eid etype value]}]
@@ -772,10 +848,10 @@
                                         (run-checks! ctx pre-checks))
 
                   ;; transact to DB
-                  tx-step-maps         (tx/reorder-tx-steps ops-order tx-step-maps)
+                  tx-step-maps         ordered-tx-step-maps
                   tx-data              (io/expect-io
                                         (tx/transact-without-tx-conn-impl! tx-conn (:attrs ctx) app-id tx-step-maps {}))
-                  _                    (validate-retracted! ctx entities-map tx-step-maps tx-data)
+                  _                    (validate-retracted! ctx entities-map cleared tx-step-maps tx-data)
 
                   ;; post checks
                   create-lookups-map   (io/expect-io
