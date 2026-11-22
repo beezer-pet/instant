@@ -2,6 +2,7 @@
   (:require
    [clojure.string :as string]
    [clojure.test :as test :refer [are deftest is testing]]
+   [clojure.walk :as walk]
    [instant.data.bootstrap :as bootstrap]
    [instant.data.constants :as constants]
    [instant.data.resolvers :as resolvers]
@@ -25,7 +26,7 @@
    [instant.util.aws-signature :as aws-sig]
    [instant.util.coll :as ucoll]
    [instant.util.exception :as ex]
-   [instant.util.instaql :refer [instaql-nodes->object-tree]]
+   [instant.util.instaql :refer [instaql-nodes->object-meta instaql-nodes->object-tree]]
    [instant.util.test :refer [instant-ex-data pretty-perm-q with-sketches stuid]]
    [instant.reactive.ephemeral :as eph]
    [instant.reactive.store :as rs]
@@ -4974,6 +4975,163 @@
                          (get "$files")
                          vec))))))))))
 
+;; A where clause that matched through a record or a field the reader may not
+;; view must not decide which entities come back, or the reader can test
+;; hidden values with it.
+(deftest where-does-not-test-what-the-reader-may-not-view
+  (with-zeneca-app
+    (fn [app _r]
+      (let [ctx {:app-id (:id app)}
+            handles (fn [q]
+                      (set (map :handle (:users (pretty-perm-q ctx q)))))
+            put-rules! (fn [code]
+                         (rule-model/put! (aurora/conn-pool :write)
+                                          {:app-id (:id app) :code code}))]
+        (testing "through a link to records the reader may not view"
+          (put-rules! {:users {:allow {:view "true"}}
+                       :books {:allow {:view "false"}}})
+          (testing "in an or beside a branch that matches"
+            (is (= #{"joe"}
+                   (handles {:users {:$ {:where {:or [{:handle "alex"
+                                                       :bookshelves.books.title "Catch and Kill"}
+                                                      {:handle "joe"}]}}}}))))
+          (testing "with $ne"
+            (is (= #{}
+                   (handles {:users {:$ {:where {:handle "alex"
+                                                 :bookshelves.books.title {:$ne "No such book"}}}}}))))
+          (testing "with $isNull"
+            (is (= #{}
+                   (handles {:users {:$ {:where {:handle "alex"
+                                                 :bookshelves.books.title {:$isNull false}}}}})))))
+        (testing "on a field the reader may not view"
+          (put-rules! {:users {:allow {:view "true"}
+                               :fields {:email "false"}}})
+          (testing "in an or beside a branch that matches"
+            (is (= #{"joe"}
+                   (handles {:users {:$ {:where {:or [{:handle "alex"
+                                                       :email "alex@instantdb.com"}
+                                                      {:handle "joe"}]}}}}))))
+          (testing "with $ne"
+            (is (= #{}
+                   (handles {:users {:$ {:where {:email {:$ne "nobody@example.com"}}}}}))))
+          (testing "with $isNull"
+            (is (= #{}
+                   (handles {:users {:$ {:where {:email {:$isNull false}}}}})))
+            (is (= #{}
+                   (handles {:users {:$ {:where {:email {:$isNull true}}}}})))))
+        (testing "an entity that also matches through what the reader may view is returned"
+          (put-rules! {:users {:allow {:view "true"}}
+                       :books {:allow {:view "false"}}})
+          (testing "with the same triples, whatever else it matches"
+            (let [triples (fn [title]
+                            (->> {:users {:$ {:where {:handle "alex"
+                                                      :or [{:bookshelves.books.title title}
+                                                           {:fullName "Alex"}]}}}}
+                                 (iq/permissioned-query (assoc (make-ctx app) :datalog-query-fn d/query))
+                                 (mapcat iq/data-seq)
+                                 (mapcat #(get-in % [:datalog-result :join-rows]))
+                                 (into #{} cat)))]
+              (is (seq (triples "No such book")))
+              (is (= (triples "No such book")
+                     (triples "Catch and Kill")))))
+          (is (= #{"alex"}
+                 (handles {:users {:$ {:where {:handle "alex"
+                                               :or [{:bookshelves.books.title "Catch and Kill"}
+                                                    {:fullName "Alex"}]}}}})))
+          (is (= #{"alex"}
+                 (handles {:users {:$ {:where {:or [{:handle "alex"
+                                                     :bookshelves.books.title "Catch and Kill"}
+                                                    {:handle "alex"}]}
+                                       :limit 5}}})))
+          (testing "whatever number of ors it matches"
+            (is (= #{"alex"}
+                   (handles {:users {:$ {:where {:and (vec (repeat 14 {:or [{:handle "alex" :fullName "Alex"}
+                                                                           {:handle "alex" :email "alex@instantdb.com"}
+                                                                           {:fullName "Alex" :email "alex@instantdb.com"}]}))}}}})))))))))
+
+;; A page is filled with the entities the reader may view. An entity they may
+;; not view, or that matched through data they may not view, takes no place
+;; in it and doesn't show in its page info.
+(deftest pages-hold-what-the-reader-may-view
+  (with-zeneca-checked-data-app
+    (fn [app r]
+      (let [page (fn [q]
+                   (let [ctx (assoc (make-ctx app) :datalog-query-fn d/query)
+                         nodes (iq/permissioned-query ctx q)
+                         page-info (get-in (instaql-nodes->object-meta nodes)
+                                           [:page-info "users"])]
+                     {:handles (->> (instaql-nodes->object-tree ctx nodes)
+                                    walk/keywordize-keys
+                                    :users
+                                    (map :handle)
+                                    set)
+                      :next? (:has-next-page? page-info)
+                      :previous? (:has-previous-page? page-info)
+                      :cursors (select-keys page-info [:start-cursor :end-cursor])}))
+            put-rules! (fn [code]
+                         (rule-model/put! (aurora/conn-pool :write)
+                                          {:app-id (:id app) :code code}))
+            probe (fn [title option-map]
+                    (page {:users {:$ (merge {:where {:or [{:handle "alex"
+                                                            :bookshelves.books.title title}
+                                                           {:handle "joe"}]}}
+                                             option-map)}}))
+            _ (put-rules! {:users {:allow {:view "true"}}})
+            alex-cursor (-> (page {:users {:$ {:where {:handle "alex"} :limit 1}}})
+                            :cursors
+                            :start-cursor)]
+        (testing "a match through records the reader may not view"
+          (put-rules! {:users {:allow {:view "true"}}
+                       :books {:allow {:view "false"}}})
+          (doseq [direction ["asc" "desc"]
+                  option-map [{:limit 1}
+                              {:first 1}
+                              {:last 1}
+                              {:limit 1 :offset 1}
+                              {:first 1 :before alex-cursor}
+                              {:last 1 :after alex-cursor}]
+                  :let [option-map (assoc option-map :order {:serverCreatedAt direction})]]
+            (testing (pr-str option-map)
+              (is (= (probe "No such book" option-map)
+                     (probe "Catch and Kill" option-map))))))
+        (testing "entities the reader may not view"
+          (put-rules! {:users {:allow {:view "data.handle != 'alex'"}}})
+          (doseq [direction ["asc" "desc"]
+                  :let [order {:serverCreatedAt direction}]]
+            (testing direction
+              (let [{:keys [handles next? previous?]} (page {:users {:$ {:limit 3 :order order}}})]
+                (is (= #{"joe" "stopa" "nicolegf"} handles))
+                (is (false? next?))
+                (is (false? previous?)))
+              (let [first-page (page {:users {:$ {:limit 2 :order order}}})
+                    second-page (page {:users {:$ {:limit 2 :offset 2 :order order}}})]
+                (is (= 2 (count (:handles first-page))))
+                (is (true? (:next? first-page)))
+                (is (= 1 (count (:handles second-page))))
+                (is (false? (:next? second-page)))
+                (is (true? (:previous? second-page)))
+                (is (= #{"joe" "stopa" "nicolegf"}
+                       (into (:handles first-page) (:handles second-page)))))))
+          (testing "with an offset alone"
+            (is (= 2 (count (:handles (page {:users {:$ {:offset 1}}}))))))
+          (testing "a page is as long as its limit, however far we scan for it"
+            (with-redefs [iq/max-page-scan 0]
+              (is (= #{"joe" "stopa" "nicolegf"}
+                     (:handles (page {:users {:$ {:limit 3}}})))))))
+        (testing "ordered by a field the reader may not view"
+          (put-rules! {:users {:allow {:view "true"}
+                               :fields {:email "false"}}})
+          (let [email-attr-id (resolvers/->uuid r :users/email)]
+            (is (= {:handles #{}
+                    :next? false
+                    :previous? false
+                    :cursors {:start-cursor nil :end-cursor nil}}
+                   (page {:users {:$ {:order {:email "asc"} :limit 2}}})))
+            (is (= (page {:users {:$ {:order {:email "asc"}
+                                      :after [(random-uuid) email-attr-id "a" 0]}}})
+                   (page {:users {:$ {:order {:email "asc"}
+                                      :after [(random-uuid) email-attr-id "z" 0]}}})))))))))
+
 (deftest rule-wheres
   (with-zeneca-app
     (fn [app r]
@@ -5200,7 +5358,10 @@
               :code {"users"
                      {"allow" {"view" "rateLimit.readUsers.limit(auth.id)"}}
                      "$rateLimits"
-                     {"readUsers" {"limits" [{"capacity" 4}]}}}})
+                     ;; A page of two checks three users: the two it
+                     ;; returns and the next, to know that another page
+                     ;; follows.
+                     {"readUsers" {"limits" [{"capacity" 6}]}}}})
 
             (testing "first query succeeds"
               (is (= 2 (count (:users (pretty-perm-q

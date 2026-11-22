@@ -2975,6 +2975,39 @@
    :symbol-values (empty-symbol-values named-patterns)
    :join-rows #{}})
 
+(defn- pattern-triple
+  "The triple a pattern matched in a sql row. The triple of a $isNull on the
+   pattern's own entity carries the attr it tests as `::null-check-attr`."
+  [row cte-cols pattern coerce-uuids?]
+  (let [triple (sql-row->triple row cte-cols coerce-uuids?)
+        [v-tag v-value] (:v pattern)
+        is-null (when (= :function v-tag)
+                  (:$isNull v-value))]
+    (if (and is-null (not (:reverse? is-null)))
+      (with-meta triple {::null-check-attr (:attr-id is-null)})
+      triple)))
+
+(def ^:private empty-clause {:triples [] :ors []})
+
+(defn- row-clause
+  "What a sql row matched, as a clause: the triples of its patterns outside of
+   any OR, and for each OR the clauses of the OR that matched."
+  [row pattern-metas coerce-uuids?]
+  (reduce (fn [clause pattern-meta]
+            (if-let [ors (:or pattern-meta)]
+              (let [matched (into []
+                                  (comp (map #(row-clause row % coerce-uuids?))
+                                        (remove #{empty-clause}))
+                                  ors)]
+                (cond-> clause
+                  (seq matched) (update :ors conj matched)))
+              (let [{:keys [cte-cols pattern]} pattern-meta
+                    triple (pattern-triple row cte-cols pattern coerce-uuids?)]
+                (cond-> clause
+                  (some? (first triple)) (update :triples conj triple)))))
+          empty-clause
+          pattern-metas))
+
 (defn- accumulate-results
   "Takes the sql result and the metadata from `match-query` to
    return join-rows, symbol-values, and topics.
@@ -3018,7 +3051,7 @@
              topics (named-pattern->topics pattern symbol-values-for-topics)
              {:keys [join-rows page-info-rows symbol-values symbol-values-for-topics]}
              (reduce (fn [acc row]
-                       (let [join-row (sql-row->triple row cte-cols coerce-uuids?)
+                       (let [join-row (pattern-triple row cte-cols pattern coerce-uuids?)
                              page-info-row (when page-info
                                              (if-not (nil? (first join-row))
                                                join-row
@@ -3109,20 +3142,50 @@
           []
           pattern-metas))
 
+(declare cols-for-sym)
+
+(defn- with-matches
+  "Gives each join row of a query with ORs, as `::clauses` in its metadata,
+   what each of the sql rows it came from matched (see `row-clause`). With
+   `join-sym`, the symbol that the group's children join on, adds
+   `:join-rows-by-join-val`: for each value of the symbol, the join rows that
+   matched it."
+  [{:keys [join-rows] :as res} sql-res pattern-metas coerce-uuids? join-sym]
+  (let [join-rows (if (some :or pattern-metas)
+                    (let [clauses (reduce (fn [acc [join-row row]]
+                                            (update acc join-row (fnil conj [])
+                                                    (row-clause row pattern-metas coerce-uuids?)))
+                                          {}
+                                          (map vector join-rows sql-res))]
+                      (mapv #(with-meta % {::clauses (clauses %)}) join-rows))
+                    join-rows)]
+    (cond-> (assoc res :join-rows join-rows)
+      join-sym (assoc :join-rows-by-join-val
+                      (let [cols (cols-for-sym pattern-metas join-sym)]
+                        (reduce (fn [acc [row join-row]]
+                                  (if-let [join-val (some #(get row %) cols)]
+                                    (update acc (str join-val) (fnil conj []) join-row)
+                                    acc))
+                                {}
+                                (map vector sql-res join-rows)))))))
+
 (defn- sql-result->result
   "Takes the sql result and the metadata from `match-query` to
    return join-rows, symbol-values, and topics.
    Optionally parses uuids, when handling batched results that return JSON."
-  [sql-res pattern-metas coerce-uuids?]
-  (-> (accumulate-results {:join-rows (vec (repeat (count sql-res) []))
-                           :symbol-values {}
-                           :symbol-values-for-topics {}
-                           :topics []}
-                          sql-res
-                          pattern-metas
-                          coerce-uuids?)
-      (update :join-rows set)
-      (dissoc :symbol-values-for-topics)))
+  ([sql-res pattern-metas coerce-uuids?]
+   (sql-result->result sql-res pattern-metas coerce-uuids? nil))
+  ([sql-res pattern-metas coerce-uuids? join-sym]
+   (-> (accumulate-results {:join-rows (vec (repeat (count sql-res) []))
+                            :symbol-values {}
+                            :symbol-values-for-topics {}
+                            :topics []}
+                           sql-res
+                           pattern-metas
+                           coerce-uuids?)
+       (with-matches sql-res pattern-metas coerce-uuids? join-sym)
+       (update :join-rows set)
+       (dissoc :symbol-values-for-topics))))
 
 (defn- seeks-leaf-result [rows group pattern-metas]
   (let [{:keys [cte-cols pattern symbol-fields] :as pattern-meta} (first pattern-metas)
@@ -3205,7 +3268,7 @@
 (defn cols-for-sym [pattern-metas sym]
   (reduce (fn [acc pattern-meta]
             (if-let [ors (:or pattern-meta)]
-              (into acc (cols-for-sym ors sym))
+              (into acc (mapcat #(cols-for-sym % sym)) ors)
               (into acc (keep (fn [[k v]]
                                 (when (= (:sym v) sym)
                                   (nth (:cte-cols pattern-meta) k)))
@@ -3278,7 +3341,10 @@
                                                  pattern-metas)
                      result (cond-> (or (when (and (true? seeks-leaf-result?) join-sym)
                                           (seeks-leaf-result rows group transformed-pattern-metas))
-                                        (sql-result->result rows transformed-pattern-metas true))
+                                        (sql-result->result rows
+                                                            transformed-pattern-metas
+                                                            true
+                                                            (:join-sym (:children group))))
                               (:page-info group) (assoc-in [:page-info :has-next-page?]
                                                            (-> sql-res
                                                                (get (name (has-next-tbl table)))
@@ -3310,6 +3376,7 @@
                                      (:datalog-query group))]
                  (conj acc (if-let [{:keys [join-sym]} (:children group)]
                              {:result result
+                              :join-val join-val
                               :datalog-query datalog-query
                               :children (mapv (fn [join-val]
                                                 (nested-sql-result->result {:join-sym join-sym
@@ -3324,6 +3391,7 @@
                                                   (when (= join-sym (:join-sym parent-info))
                                                     [(:join-val parent-info)])))}
                              {:result result
+                              :join-val join-val
                               :datalog-query datalog-query})))))
            []
            (:pattern-groups children))))
