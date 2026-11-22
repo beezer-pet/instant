@@ -10,16 +10,19 @@
    [instant.jdbc.aurora :as aurora]
    [instant.jdbc.sql :as sql]))
 
-;; core/start launches the custodian worker, so an ambient worker would race
-;; these tests (claiming/draining the rows we enqueue). Stop it for the duration
-;; and drive the logic directly, then restart it.
+;; A running custodian worker would race these tests (claiming/draining the
+;; rows we enqueue). Stop it for the duration and drive the logic directly, then
+;; restart it if it was running. The test runner doesn't start one, and one left
+;; running would tick inside the tests that take the connection pool away.
 (use-fixtures :once
   (fn [f]
-    (custodian/stop)
-    (try
-      (f)
-      (finally
-        (custodian/start)))))
+    (let [running? (some? @custodian/worker)]
+      (custodian/stop)
+      (try
+        (f)
+        (finally
+          (when running?
+            (custodian/start)))))))
 
 ;; ----------
 ;; Helpers
