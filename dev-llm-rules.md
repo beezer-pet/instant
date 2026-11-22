@@ -26,32 +26,6 @@ Whenever writing prose for docs, announcements, or marketing materials you shoul
 follow the style of those existing materials. You should also avoid tell-tale
 signs of AI generated content like em-dashes.
 
-# Writing an Announcement
-
-If I ask you to make an announcement post can you do it in the style of how we usually do
-announcements? You can see some example announcements in claude-docs/announcements
-
-# Writing tweets / tweetstorm
-
-Whenever I ask you to make tweets/tweetstorm look at claude-docs/tweets for our style of writing tweets.
-
-Note: With Twitter we should minimize usage of backticks and only use them for
-code snippets. We should also avoid using double dashes and emojis as they are a common
-sign of AI generated content.
-
-## Best practices for announcements
-
-* Use bullets for separate sections instead of headers
-* If something is in a code block it doesn't need to be bolded or italicized
-
-# Writing a team spec
-
-If I ask you to write a spec for my team, can you do it in the style we
-usually write specs? These specs are different than the spec we would write for
-implementing. They are more high level and make it easy for the team to align on
-the proposed solution before we implement. You can see some example specs in
-claude-docs/specs
-
 # Removing Slop
 
 After you have a working solution you should go back and remove any slop in the
