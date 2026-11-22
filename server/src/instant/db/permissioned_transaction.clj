@@ -101,11 +101,14 @@
      *Note*: we special case $files, so _even admins can't update_ those columns. 
      This is because $files includes information like `file size`, 
      which only Instant can set."
-  [ctx tx-step-maps]
-  (doseq [{:keys [op etype] :as tx-step} tx-step-maps
+  [{:keys [attrs] :as ctx} tx-step-maps]
+  (doseq [{:keys [op etype aid] :as tx-step} tx-step-maps
           :when (and etype (string/starts-with? etype "$"))
           :when (#{:add-triple :deep-merge-triple :retract-triple :delete-entity} op)]
-    (if (= :delete-entity op)
+    (if (or (= :delete-entity op)
+            ;; without its id an entity drops out of its etype's listing
+            (and (= :retract-triple op)
+                 (= "id" (attr-model/fwd-label (attr-model/seek-by-id aid attrs)))))
       (validate-system-delete-entity! ctx  tx-step)
       (validate-system-triple-op! ctx tx-step))))
 
@@ -271,9 +274,12 @@
    Used for request.modifiedFields in CEL update rules."
   [target-eid tx-steps attrs]
   (->> tx-steps
-       (filter (fn [{:keys [op eid]}]
+       (filter (fn [{:keys [op eid rev-etype]}]
                  (and (= target-eid eid)
-                      (#{:add-triple :deep-merge-triple} op))))
+                      (or (#{:add-triple :deep-merge-triple} op)
+                          ;; a retract of a link is an unlink, not a field
+                          (and (= :retract-triple op)
+                               (nil? rev-etype))))))
        (map (fn [{:keys [aid]}]
               (let [attr (attr-model/seek-by-id aid attrs)
                     [_ _ label] (:forward-identity attr)]
@@ -284,6 +290,40 @@
        (remove #(= % "id"))
        distinct
        vec))
+
+(defn validate-retracts!
+  "A retract is checked through the entity it names. One of an attribute
+   that doesn't exist, or through a lookup that finds no entity, would be
+   given no check, so it is refused."
+  [{:keys [attrs]} tx-steps]
+  (doseq [{:keys [op eid etype aid value rev-etype] :as tx-step} tx-steps
+          :when (= :retract-triple op)]
+    (when-not etype
+      (throw-tx-step-validation-err! tx-step "Could not find the attribute for this retract"))
+    (doseq [lookup [eid (when (or rev-etype
+                                  (= "id" (attr-model/fwd-label (attr-model/seek-by-id aid attrs))))
+                          value)]
+            :when (lookup-ref? lookup)]
+      (ex/throw-validation-err! :lookup lookup [{:message "Could not find the entity for this lookup"}]))))
+
+(defn validate-retracted!
+  "A retract is checked through the entity it names, as the entity was before
+   the transaction. One that deleted a triple of an entity that was not there
+   then, other than a triple the transaction wrote itself, was given no
+   check, so the transaction is refused."
+  [ctx entities-map tx-steps tx-data]
+  (let [loaded  (into #{}
+                      (for [[{:keys [eid etype]} entity] entities-map
+                            :when entity]
+                        [(str eid) etype]))
+        written (into #{}
+                      (for [{:keys [op eid aid]} tx-steps
+                            :when (#{:add-triple :deep-merge-triple} op)]
+                        [(str eid) (str aid)]))]
+    (doseq [{:keys [entity_id attr_id]} (get-in tx-data [:results :retract-triple])
+            :when (not (or (loaded [(str entity_id) (extract-etype ctx attr_id)])
+                           (written [(str entity_id) (str attr_id)])))]
+      (ex/throw-validation-err! :eid entity_id [{:message "Could not find the entity for this retract"}]))))
 
 (defn pre-checks
   "Checks that run before tx: update, delete for attrs & objects"
@@ -460,7 +500,21 @@
                                :new-data    (get updated-entities-map rev-key)
                                :rule-params (merge rule-params rev-rule-params)}}]))
 
-               (and (#{:add-triple :deep-merge-triple} op)
+               ;; without its id an entity drops out of its etype's listing
+               (and (= :retract-triple op)
+                    (not ref?)
+                    (= "id" fwd-label))
+               [{:scope    :object
+                 :action   :delete
+                 :etype    etype
+                 :eid      eid
+                 :program  (or (rule-model/get-program! rules etype "delete")
+                               {:result true})
+                 :bindings {:data        entity
+                            :rule-params rule-params}}]
+
+               ;; a retract that gets here is not of a link
+               (and (#{:add-triple :deep-merge-triple :retract-triple} op)
                     entity)
                [{:scope    :object
                  :action   :update
@@ -696,6 +750,7 @@
                   entities-map         (io/expect-io
                                         (load-entities-map ctx tx-step-maps))
                   tx-step-maps         (resolve-lookups-tx-steps ctx entities-map tx-step-maps)
+                  _                    (validate-retracts! ctx tx-step-maps)
                   entities-map         (resolve-lookups-entities-map ctx entities-map)
                   updated-entities-map (update-entities-map ctx entities-map tx-step-maps)
                   rule-params-map      (persistent!
@@ -720,6 +775,7 @@
                   tx-step-maps         (tx/reorder-tx-steps ops-order tx-step-maps)
                   tx-data              (io/expect-io
                                         (tx/transact-without-tx-conn-impl! tx-conn (:attrs ctx) app-id tx-step-maps {}))
+                  _                    (validate-retracted! ctx entities-map tx-step-maps tx-data)
 
                   ;; post checks
                   create-lookups-map   (io/expect-io

@@ -4482,7 +4482,15 @@
 
         (is (validation-err?
              (permissioned-tx/transact! (make-ctx)
-                                        [[:delete-entity id "$users"]])))))))
+                                        [[:delete-entity id "$users"]])))
+
+        (testing "a retract of the id is refused as a delete is"
+          (rule-model/put! (aurora/conn-pool :write)
+                           {:app-id app-id
+                            :code {:$default {:allow {:$default "true"}}}})
+          (is (validation-err?
+               (permissioned-tx/transact! (make-ctx)
+                                          [[:retract-triple id (resolvers/->uuid r :$users/id) (str id)]]))))))))
 
 (deftest perms-accepts-writes-to-custom-user-columns
   (with-empty-app
@@ -5750,6 +5758,160 @@
               (make-ctx)
               [[:add-triple todo-id attr-todos-id   todo-id]
                [:add-triple todo-id attr-todos-text [#uuid "2473c57f-6a58-4167-96b7-cf9e034a670a" #uuid "7758b4b1-7c0b-4c90-9532-f41a54812f76"]]])))))))
+
+(deftest retract-triple-checks
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id (test-util/make-attrs
+                      app-id
+                      [[:item/id :unique? :index?]
+                       [:item/key :unique? :index?]
+                       [:item/secret]
+                       [:item/note]
+                       [:item/old]
+                       [:tag/id :unique? :index?]
+                       [:tag/label]
+                       [[:item/tags :tag/items] :many]])
+            item-id  (attr->id :item/id)
+            item-key (attr->id :item/key)
+            secret   (attr->id :item/secret)
+            note     (attr->id :item/note)
+            old      (attr->id :item/old)
+            tags     (attr->id :item/tags)
+            item     (random-uuid)
+            tag      (random-uuid)
+            make-ctx (fn [admin?]
+                       {:db               {:conn-pool (aurora/conn-pool :write)}
+                        :app-id           app-id
+                        :attrs            (attr-model/get-by-app-id app-id)
+                        :datalog-query-fn d/query
+                        :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                        :current-user     nil
+                        :admin?           admin?})
+            put-rules! (fn [rules]
+                         (rule-model/put! (aurora/conn-pool :write)
+                                          {:app-id app-id
+                                           :code   {:item {:allow rules}}}))
+            put-rule! (fn [update-rule]
+                        (put-rules! {:update update-rule}))
+            restore!  (fn []
+                        (test-util/insert-entities
+                         app-id attr->id
+                         [{:db/id tag :tag/id tag :tag/label "t"}
+                          {:db/id item :item/id item :item/key "k" :item/secret "s" :item/note "n"
+                           :item/old "o" :item/tags tag}]))
+            retract!  (fn retract!
+                        ([admin? aid value]
+                         (retract! admin? item aid value))
+                        ([admin? eid aid value]
+                         (permissioned-tx/transact! (make-ctx admin?) [[:retract-triple eid aid value]])))
+            stored    (fn [aid]
+                        (into #{}
+                              (map last)
+                              (fetch-triples app-id [[:= :entity-id item] [:= :attr-id aid]])))]
+        (restore!)
+        (testing "a rule that refuses every update refuses it"
+          (put-rule! "false")
+          (is (perm-err? (retract! false secret "s")))
+          (is (= #{"s"} (stored secret))))
+        (testing "newData is without the value"
+          (put-rule! "newData.secret == data.secret")
+          (is (perm-err? (retract! false secret "s")))
+          (is (= #{"s"} (stored secret)))
+          (is (perm-pass? (retract! false note "n")))
+          (is (= #{} (stored note))))
+        (restore!)
+        (testing "the attribute is among the modified fields"
+          (put-rule! "request.modifiedFields.all(field, field == 'note')")
+          (is (perm-err? (retract! false secret "s")))
+          (is (perm-pass? (retract! false note "n")))
+          (is (= #{"s"} (stored secret)))
+          (is (= #{} (stored note))))
+        (testing "a link retracted is not among them"
+          (put-rule! "size(request.modifiedFields) == 0")
+          (is (perm-pass? (retract! false tags tag)))
+          (is (= #{} (stored tags))))
+        (testing "an admin is asked no rule"
+          (put-rule! "false")
+          (is (retract! true secret "s"))
+          (is (= #{} (stored secret))))
+        (restore!)
+        (testing "through a lookup that finds the entity it is checked"
+          (put-rule! "false")
+          (is (perm-err? (retract! false [item-key "k"] secret "s")))
+          (put-rule! "true")
+          (is (perm-pass? (retract! false [item-key "k"] note "n")))
+          (is (= #{"s"} (stored secret)))
+          (is (= #{} (stored note))))
+        (restore!)
+        (testing "through a lookup that finds no entity it is refused"
+          (put-rule! "true")
+          (testing "on an attribute that is not unique"
+            (is (validation-err? (retract! false [note "n"] secret "s")))
+            (is (validation-err? (retract! false [note "n"] tags tag))))
+          (testing "for the entity that is linked"
+            (is (validation-err? (retract! false tags [(attr->id :tag/label) "t"]))))
+          (testing "for the id"
+            (is (validation-err? (retract! false item-id [note "n"]))))
+          (is (= #{"s"} (stored secret)))
+          (is (= #{tag} (stored tags)))
+          (is (= #{(str item)} (stored item-id))))
+        (testing "a link through a lookup that finds its entity is checked"
+          (put-rule! "false")
+          (is (perm-err? (retract! false [item-key "k"] tags [(attr->id :tag/id) tag])))
+          (put-rule! "true")
+          (is (perm-pass? (retract! false [item-key "k"] tags [(attr->id :tag/id) tag])))
+          (is (= #{} (stored tags))))
+        (testing "of an entity that is not there it does nothing"
+          (put-rule! "false")
+          (is (perm-pass? (retract! false (random-uuid) secret "s")))
+          (is (perm-pass? (retract! false (random-uuid) tags tag))))
+        (testing "of an entity made after the checks read it, it is refused"
+          (let [load-fn   permissioned-tx/load-entities-map
+                made-late (fn [eid tx-steps]
+                            (with-redefs [permissioned-tx/load-entities-map
+                                          (fn [& args]
+                                            (let [entities (apply load-fn args)]
+                                              (test-util/insert-entities
+                                               app-id attr->id
+                                               [{:db/id eid :item/id eid :item/secret "s"}])
+                                              entities))]
+                              (permissioned-tx/transact! (make-ctx false) tx-steps)))
+                secret-of (fn [eid]
+                            (fetch-triples app-id [[:= :entity-id eid] [:= :attr-id secret]]))]
+            (put-rule! "false")
+            (let [late (random-uuid)]
+              (is (validation-err? (made-late late [[:retract-triple late secret "s"]])))
+              (is (= #{[late secret "s"]} (secret-of late))))
+            (testing "also when the transaction writes to it"
+              (put-rules! {:create "true" :update "false"})
+              (let [late (random-uuid)]
+                (is (validation-err? (made-late late [[:add-triple late note "mine"]
+                                                      [:retract-triple late secret "s"]])))
+                (is (= #{[late secret "s"]} (secret-of late)))))))
+        (testing "of a link that the transaction made on a new entity it goes through"
+          (put-rules! {:create "true" :update "false"})
+          (let [made (random-uuid)]
+            (is (perm-pass? (permissioned-tx/transact! (make-ctx false)
+                                                       [[:add-triple made item-id made]
+                                                        [:add-triple made tags tag]
+                                                        [:retract-triple made tags tag]])))
+            (is (= #{} (fetch-triples app-id [[:= :entity-id made] [:= :attr-id tags]])))))
+        (testing "of the id it is checked as a delete"
+          (put-rules! {:update "true" :delete "false"})
+          (is (perm-err? (retract! false item-id item)))
+          (is (= #{(str item)} (stored item-id)))
+          (put-rules! {:update "false" :delete "true"})
+          (is (perm-pass? (retract! false item-id item)))
+          (is (= #{} (stored item-id))))
+        (testing "of an attribute that doesn't exist it is refused"
+          (put-rule! "true")
+          (is (validation-err? (retract! false (random-uuid) "o")))
+          (tx/transact! (aurora/conn-pool :write) (attr-model/get-by-app-id app-id) app-id [[:delete-attr old]])
+          (is (validation-err? (retract! false old "o")))
+          (is (= [{:count 1}]
+                 (sql/select (aurora/conn-pool :read)
+                             ["select count(*) from triples where app_id = ? and attr_id = ?" app-id old]))))))))
 
 (deftest idle-in-transaction-error
   (with-empty-app
