@@ -1091,6 +1091,7 @@
           (let [nodes (map (fn [child]
                              (add-children
                               (make-node {:etype (:etype form)
+                                          :join-val (:join-val (first child))
                                           :datalog-query (:datalog-query (first child))
                                           :datalog-result (let [result (:result (first child))]
                                                             (if (= (:etype form) "$files")
@@ -1875,6 +1876,15 @@
     (query-byop ctx o)
     (query-normal ctx o)))
 
+(defn- checked-pairs
+  "The [e a] pairs whose view and field rules decide whether a triple of a
+   join row is viewable: its own and, for the triple of a $isNull, the attr
+   that the $isNull tested on the entity."
+  [[e a :as triple]]
+  (if-let [null-check-attr (::d/null-check-attr (meta triple))]
+    [[e a] [e null-check-attr]]
+    [[e a]]))
+
 (defn- join-rows->etype-maps
   "Takes a set of join-rows and returns maps from entity id to etype and
    etype to program."
@@ -1909,7 +1919,7 @@
                                  (rule-model/get-field-program! rules etype label))))))))
 
       acc
-      join-rows))
+      (eduction (mapcat checked-pairs) join-rows)))
    acc
    (get-in data [:datalog-result :join-rows])))
 
@@ -1964,7 +1974,7 @@
                                            (update :checked-eids (fnil conj #{}) e))]
                                (assoc etypes etype entry)))
                            etypes
-                           join-row))
+                           (eduction (mapcat checked-pairs) join-row)))
                         (:etype->eids+program acc)
                         (get-in data [:datalog-result :join-rows]))
                        acc (-> (cond-> acc
@@ -2023,13 +2033,52 @@
 (defn viewable-join-row? [attrs etype+eid->check join-row]
   (every? (partial viewable-triple? attrs etype+eid->check) join-row))
 
-(defn permissioned-node [{:keys [attrs] :as ctx} etype+eid->check res]
-  (let [cleaned-join-rows (->> res
-                               :data
-                               :datalog-result
-                               :join-rows
-                               (filter (partial viewable-join-row? attrs etype+eid->check))
-                               set)
+(defn- viewable-clause-triples
+  "The triples of a clause that matched through data the user may view: its
+   own and, for each of its ORs, those of the clauses that did. Nil if it
+   didn't match through such data."
+  [viewable? {:keys [triples ors]}]
+  (when (every? viewable? triples)
+    (reduce (fn [acc clauses]
+              (if-let [viewable (seq (keep #(viewable-clause-triples viewable? %) clauses))]
+                (into acc cat viewable)
+                (reduced nil)))
+            triples
+            ors)))
+
+(defn- viewable-join-row
+  "The triples of a join row that matched through data the user may view, or
+   nil if it didn't."
+  [attrs etype+eid->check join-row]
+  (let [viewable? (fn [triple]
+                    (every? (partial viewable-triple? attrs etype+eid->check)
+                            (checked-pairs triple)))]
+    (if-let [clauses (::d/clauses (meta join-row))]
+      (not-empty (into []
+                       (comp (keep #(viewable-clause-triples viewable? %))
+                             cat
+                             (distinct))
+                       clauses))
+      (when (every? viewable? join-row)
+        join-row))))
+
+(defn permissioned-node
+  "Removes what the user may not view from a node of the query's result. An
+   entity is kept only if one of the join rows that matched it did so through
+   data the user may view."
+  [{:keys [attrs] :as ctx} etype+eid->check res]
+  (let [viewable-join-rows (into {}
+                                 (keep (fn [join-row]
+                                         (when-let [viewable (viewable-join-row attrs etype+eid->check join-row)]
+                                           [join-row viewable])))
+                                 (get-in res [:data :datalog-result :join-rows]))
+        cleaned-join-rows (set (vals viewable-join-rows))
+        join-rows-by-join-val (get-in res [:data :datalog-result :join-rows-by-join-val])
+        matched-viewably? (fn [child-node]
+                            (let [join-val (get-in child-node [:data :join-val])]
+                              (or (nil? join-val)
+                                  (some viewable-join-rows
+                                        (get join-rows-by-join-val (str join-val))))))
         cleaned-page-info
         (when (get-in res [:data :datalog-result :page-info])
           (let [filtered-rows (seq (filter
@@ -2052,11 +2101,13 @@
         (assoc-in [:data :datalog-result :join-rows] cleaned-join-rows)
         (ucoll/assoc-in-when [:data :datalog-result :page-info] cleaned-page-info)
         (ucoll/dissoc-in [:data :datalog-result :page-info-rows])
+        (ucoll/dissoc-in [:data :datalog-result :join-rows-by-join-val])
         (update :child-nodes
                 (fn [child-nodes]
                   (if (empty? cleaned-join-rows)
                     []
                     (->> child-nodes
+                         (filter matched-viewably?)
                          (map (partial permissioned-node ctx etype+eid->check))
                          (filter
                           (fn [node]
@@ -2374,6 +2425,148 @@
               {}
               o)))
 
+(def max-page-scan
+  "How many entities past the ones a page asks for we fetch to fill it with
+   entities the user may view."
+  10000)
+
+(defn- pages? [form]
+  (let [{:keys [limit first last offset before after order]} (:$ form)]
+    (or limit first last offset before after order)))
+
+(defn- scan-page
+  "Fetches the first `window` entities of a top-level form that pages or
+   orders its results, from where its cursors start. Returns, in the order
+   of the scan, the entities that the user may view, that matched through
+   data they may view and whose order triple they may view, each with its
+   node, join rows and order triple.
+
+   The sql for such a form keeps one join row per entity. An entity the user
+   may view whose kept row they may not view is asked for again with all of
+   its rows, without the paging."
+  [{:keys [attrs]} run k form window]
+  (let [{last-n :last first-n :first} (:$ form)
+        scan-form (cond-> (-> form
+                              (update :$ dissoc :offset)
+                              (update-in [:$ :order] #(or % {:serverCreatedAt "asc"})))
+                    window (assoc-in [:$ (cond last-n :last first-n :first :else :limit)] window))
+        {:keys [nodes viewable-nodes etype+eid->check] :as scan} (run {k scan-form})
+        order-rows (cond-> (get-in (first nodes) [:data :datalog-result :page-info-rows])
+                     last-n reverse)
+        eid-of #(str (get-in % [:data :join-val]))
+        matched (ucoll/map-by eid-of (:child-nodes (first viewable-nodes)))
+        unmatched (->> (:child-nodes (first nodes))
+                       (remove #(contains? matched (eid-of %)))
+                       (filter #(some (partial viewable-join-row? attrs etype+eid->check)
+                                      (get-in % [:data :datalog-result :join-rows])))
+                       (mapv eid-of))
+        recheck (when (seq unmatched)
+                  (run {k (-> form
+                              (update :$ dissoc
+                                      :limit :first :last :offset :order
+                                      :before :after
+                                      :beforeInclusive :afterInclusive)
+                              (update-in [:$ :where]
+                                         (fn [where]
+                                           (let [ids {:id {:$in unmatched}}]
+                                             (if where
+                                               {:and [where ids]}
+                                               ids)))))}))
+        children (merge matched
+                        (ucoll/map-by eid-of (:child-nodes (first (:viewable-nodes recheck)))))
+        join-rows (fn [{:keys [nodes etype+eid->check]} eid]
+                    (keep #(viewable-join-row attrs etype+eid->check %)
+                          (get-in (first nodes)
+                                  [:data :datalog-result :join-rows-by-join-val eid])))]
+    {:node (first viewable-nodes)
+     :scanned (count order-rows)
+     :entities (for [[e :as order-row] order-rows
+                     :let [child (get children (str e))]
+                     :when (and child (viewable-triple? attrs etype+eid->check order-row))]
+                 {:node child
+                  :order-row order-row
+                  :join-rows (concat (join-rows scan (str e))
+                                     (when recheck
+                                       (join-rows recheck (str e))))})}))
+
+(defn- viewable-page
+  "Returns the node for a top-level form that pages or orders its results.
+
+   The page holds the entities that the user may view and that matched
+   through data they may view: the offset skips, and the limit counts, only
+   those. We scan from where the form's cursors start, growing the scan
+   until it holds the page and one entity more, which says that another page
+   follows, or until it reaches `max-page-scan` entities past the page, when
+   we say that another page follows.
+
+   The page on the other side is worked out from the form: it is said to
+   exist when the form starts from an offset or a cursor."
+  [ctx run k form]
+  (let [{:keys [limit offset before after]
+         first-n :first
+         last-n :last} (:$ form)
+        size (or limit first-n last-n)
+        offset (or offset 0)
+        enough (when size
+                 (min Integer/MAX_VALUE (+' offset size 1)))
+        {:keys [node entities cut?]}
+        (loop [window enough]
+          (let [{:keys [entities scanned] :as scan} (scan-page ctx run k form window)]
+            (cond (or (nil? window)
+                      (< scanned window)
+                      (<= enough (count entities)))
+                  scan
+
+                  (<= (+ enough max-page-scan) window)
+                  (assoc scan :cut? true)
+
+                  :else
+                  (recur (min (* 4 window) (+ enough max-page-scan))))))
+        page (cond->> (drop offset entities)
+               size (take size)
+               last-n reverse)
+        follows? (boolean (when size
+                            (or cut? (< (+' offset size) (count entities)))))]
+    (some-> node
+            (assoc-in [:data :datalog-result :join-rows]
+                      (into #{} (mapcat :join-rows) page))
+            (assoc-in [:data :datalog-result :page-info]
+                      {:start-cursor (:order-row (first page))
+                       :end-cursor (:order-row (last page))
+                       :has-next-page? (if last-n
+                                         (boolean (and (seq page)
+                                                       (or (pos? offset) before)))
+                                         (or follows?
+                                             (boolean (and (seq page) before))))
+                       :has-previous-page? (if last-n
+                                             (or follows? (some? after))
+                                             (boolean (or (pos? offset) after)))})
+            (assoc :child-nodes (mapv :node page)))))
+
+(declare permissioned-query)
+
+(defn- paged-query
+  "Runs a query whose top-level forms page or order their results: each such
+   form on its own, as `viewable-page` fills its page, and the others
+   together."
+  [ctx o]
+  (let [rule-params (:$$ruleParams o)
+        o (dissoc o :$$ruleParams)
+        run (fn [q]
+              (permissioned-query (assoc ctx ::scan? true)
+                                  (cond-> q
+                                    rule-params (assoc :$$ruleParams rule-params))))
+        unpaged-o (into {} (remove (comp pages? val)) o)
+        unpaged-nodes (when (seq unpaged-o)
+                        (ucoll/map-by #(get-in % [:data :k])
+                                      (:viewable-nodes (run unpaged-o))))]
+    (into []
+          (keep (fn [[k form]]
+                  (if (pages? form)
+                    (viewable-page ctx run k form)
+                    (get unpaged-nodes (name k)))))
+          o)))
+
 (defn permissioned-query [{:keys [app-id current-user admin?] :as ctx} o]
   (tracer/with-span! {:name "instaql/permissioned-query"
                       :attributes {:app-id app-id
@@ -2382,8 +2575,16 @@
                                    :query (pr-str o)}}
     (when-not (:testing-rule-wheres ctx) ;; Prevent infinite cycle
       (hint-testing/queue-for-testing ctx permissioned-query o))
-    (if admin?
+    (cond
+      admin?
       (query ctx (dissoc o :$$ruleParams))
+
+      (and (not (::scan? ctx))
+           (not (:table-info ctx))
+           (some pages? (vals (dissoc o :$$ruleParams))))
+      (paged-query ctx o)
+
+      :else
       (let [seeks-permission-helpers? (seeks-query-cpu-enabled? app-id o :permission-helpers)
             original-query o
             ctx (assoc ctx :preloaded-refs (cel/create-preloaded-refs-cache))
@@ -2414,7 +2615,12 @@
             etype+eid->check (get-etype+eid-check-result! ctx perm-helpers rule-params)
             res' (tracer/with-span! {:name "instaql/map-permissioned-node"}
                    (mapv (partial permissioned-node ctx etype+eid->check) res))]
-        res'))))
+        ;; A scan of `paged-query` also needs the nodes before the checks
+        (if (::scan? ctx)
+          {:nodes res
+           :etype+eid->check etype+eid->check
+           :viewable-nodes res'}
+          res')))))
 
 (defn permissioned-query-check [{:keys [app-id] :as ctx} o rules-override]
   (let [ctx (assoc ctx :preloaded-refs (cel/create-preloaded-refs-cache))
