@@ -422,6 +422,17 @@ function parseWhere(
       return [];
     }
 
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      // The server is never sent an operator whose value is undefined
+      const ops = Object.entries(v).filter(([_op, arg]) => arg !== undefined);
+      if (ops.length > 1) {
+        // Each operator of the clause is a clause of its own
+        return ops.flatMap(([op, arg]) =>
+          parseWhere(makeVar, attrsStore, etype, level, { [k]: { [op]: arg } }),
+        );
+      }
+    }
+
     const path = k.split('.');
 
     // Normalize $ne to $not

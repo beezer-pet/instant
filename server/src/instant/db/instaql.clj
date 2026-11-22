@@ -284,6 +284,12 @@
                 :in (conj (:in state) :and)
                 :message "The list of `and` conditions can't be empty."}])))
 
+         (and (map? v) (< 1 (count v)))
+         ;; Each operator of the where cond is a cond of its own
+         (mapcat (fn [[op arg]]
+                   (coerce-where-cond state attrs [k {op arg}]))
+                 v)
+
          (and (map? v) (or (contains? v :$not) (contains? v :$ne)))
          ;; If the where cond has `$not`, then the check will only include
          ;; entities where the entity has a triple with the attr. If the

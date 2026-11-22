@@ -3145,7 +3145,50 @@
               (is (= #{false} (run-query :boolean {:etype {:$ {:where {:boolean {:$not true}}}}})))
 
               (testing "uses index"
-                (is (= "triples_boolean_type_idx" (run-explain :boolean true)))))))))))
+                (is (= "triples_boolean_type_idx" (run-explain :boolean true)))))
+
+            (testing "every operator of a clause applies"
+              (is (= #{1 2 3} (run-query :number {:etype {:$ {:where {:number {:$gte 1 :$lte 3}}}}})))
+              (is (= #{1 2 3} (run-query :number {:etype {:$ {:where {:number {:$lte 3 :$gte 1}}}}})))
+              (is (= #{"2"} (run-query :string {:etype {:$ {:where {:string {:$gt "1" :$lt "3"}}}}})))
+              (is (= #{2 3} (run-query :date {:etype {:$ {:where {:date {:$gt 1 :$lt 4}}}}})))
+              (is (= #{1 3} (run-query :number {:etype {:$ {:where {:number {:$gte 1 :$lte 3 :$not 2}}}}})))
+              (is (= #{2 3} (run-query :number {:etype {:$ {:where {:number {:$in [0 2 3] :$gt 1}}}}})))
+              (is (= #{2 3} (run-query :number {:etype {:$ {:where {:number {:in [1 2 3] :$in [2 3 4]}}}}})))
+              (is (= #{0 3 4} (run-query :number {:etype {:$ {:where {:number {:$not 1 :$ne 2}}}}})))
+              (is (= #{2 3} (run-query :number {:etype {:$ {:where {:number {:$gte 1 :$lte 3}}
+                                                            :order {:number "desc"}
+                                                            :limit 2}}})))
+              (is (= #{0 2 3} (run-query :number {:etype {:$ {:where {:or [{:number 0}
+                                                                           {:number {:$gte 2 :$lt 4}}]}}}}))))))))))
+
+(deftest where-applies-every-operator-through-a-link
+  (with-zeneca-checked-data-app
+    (fn [app _r]
+      (let [ctx {:app-id (:id app)}
+            handles (fn [where]
+                      (set (map :handle (:users (pretty-perm-q ctx {:users {:$ {:where where}}})))))]
+        (testing "with $isNull"
+          (is (= #{"alex"} (handles {:handle "alex" :email {:$isNull false :$like "%instantdb.com"}})))
+          (is (= #{} (handles {:handle "alex" :email {:$isNull true :$like "%instantdb.com"}}))))
+        (testing "to one linked record"
+          (is (= #{"alex"} (handles {:handle "alex" :bookshelves.books.title {:$gt "D"}})))
+          (is (= #{"alex"} (handles {:handle "alex" :bookshelves.books.title {:$lt "R"}})))
+          (is (= #{} (handles {:handle "alex" :bookshelves.books.title {:$gt "D" :$lt "R"}}))))
+        (testing "in whatever order they are written"
+          (doseq [order [{:$gte 1 :$lte 99} {:$lte 99 :$gte 1}]]
+            (is (= #{"alex"} (handles {:handle "alex"
+                                       :bookshelves.order order
+                                       :bookshelves.name "Nonfiction"})))
+            (is (= #{} (handles {:handle "alex"
+                                 :bookshelves.order order
+                                 :bookshelves.name "Short Stories"})))
+            (is (= (handles {:handle "alex"
+                             :bookshelves.order {:$gte 1}
+                             :bookshelves.name {:$not "Nonfiction"}})
+                   (handles {:handle "alex"
+                             :bookshelves.order order
+                             :bookshelves.name {:$not "Nonfiction"}})))))))))
 
 (deftest in-with-types
   (with-zeneca-checked-data-app
