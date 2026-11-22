@@ -27,7 +27,7 @@
    [instant.util.coll :as ucoll]
    [instant.util.exception :as ex]
    [instant.util.instaql :refer [instaql-nodes->object-meta instaql-nodes->object-tree]]
-   [instant.util.test :refer [instant-ex-data pretty-perm-q with-sketches stuid]]
+   [instant.util.test :refer [instant-ex-data make-attrs pretty-perm-q with-sketches stuid]]
    [instant.reactive.ephemeral :as eph]
    [instant.reactive.store :as rs]
    [next.jdbc :as next-jdbc]
@@ -5131,6 +5131,59 @@
                                       :after [(random-uuid) email-attr-id "a" 0]}}})
                    (page {:users {:$ {:order {:email "asc"}
                                       :after [(random-uuid) email-attr-id "z" 0]}}})))))))))
+
+(deftest rules-read-values-through-refs
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [{service-id :services/id
+             capacity :services/capacity
+             closed-at :services/closedAt
+             opening :services/opening
+             seat-id :seats/id
+             seat-n :seats/n
+             seat-service :seats/service}
+            (make-attrs app-id
+                        [[:services/id :unique? :index?]
+                         [:services/capacity]
+                         [:services/closedAt]
+                         [:services/opening]
+                         [:seats/id :unique? :index?]
+                         [:seats/n]
+                         [[:seats/service :services/seats]]])
+            service (random-uuid)
+            seat (random-uuid)
+            transact! (fn [tx-steps]
+                        (tx/transact! (aurora/conn-pool :write)
+                                      (attr-model/get-by-app-id app-id)
+                                      app-id
+                                      tx-steps))
+            viewable? (fn [rule]
+                        (rule-model/put! (aurora/conn-pool :write)
+                                         {:app-id app-id
+                                          :code {:seats {:allow {:view rule}}}})
+                        (= [(str seat)]
+                           (map :id (:seats (pretty-perm-q {:app-id app-id} {:seats {}})))))]
+        (transact! [[:add-triple service service-id service]
+                    [:add-triple service capacity 8]
+                    [:add-triple service closed-at "2026-11-22"]
+                    [:add-triple service opening {:days ["mon" "tue"] :from "08:00"}]
+                    [:add-triple seat seat-id seat]
+                    [:add-triple seat seat-n 3]
+                    [:add-triple seat seat-service service]])
+        (testing "a number takes the operators of a number"
+          (is (viewable? "data.ref('service.capacity')[0] > 7"))
+          (is (viewable? "data.ref('service.capacity')[0] + data.n == 11"))
+          (is (not (viewable? "data.ref('service.capacity')[0] > 8"))))
+        (testing "a json value is read as it is stored"
+          (is (viewable? "size(data.ref('service.opening')[0].days) == 2"))
+          (is (viewable? "'from' in data.ref('service.opening')[0]"))
+          (is (not (viewable? "'until' in data.ref('service.opening')[0]"))))
+        (is (viewable? "data.ref('service.closedAt') == ['2026-11-22']"))
+        (transact! [[:add-triple service closed-at nil]])
+        (testing "an attribute that was cleared is left out"
+          (is (viewable? "data.ref('service.closedAt') == []"))
+          (is (viewable? "!data.ref('service.closedAt').exists(day, day > '2026')"))
+          (is (viewable? "data.ref('service.closedAt').all(day, day > '2026')")))))))
 
 (deftest rule-wheres
   (with-zeneca-app

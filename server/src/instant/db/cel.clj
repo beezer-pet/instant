@@ -255,6 +255,13 @@
 ;; Used for batching data.ref fetches
 (def ^{:private true :dynamic true} *register-missing-ref* nil)
 
+(defn- ref-values
+  "The values at the end of a ref's path for a rule to read. cel's operators
+   on whole numbers take longs alone, so an Integer becomes one. An attribute
+   that was cleared holds null, and is left out like one that was never set."
+  [values]
+  (into [] (comp (remove nil?) (map #(if (int? %) (long %) %))) values))
+
 (defn ref-impl [ctx {:strs [id] :as ^CelMap _m} ^String etype ^String path-str]
   (if (= id NullValue/NULL_VALUE)
     []
@@ -264,11 +271,11 @@
       (if-let [preloaded-ref (-> ctx
                                  :preloaded-refs
                                  (get ref-data))]
-        (vec preloaded-ref)
+        (ref-values preloaded-ref)
         (if-let [register-missing-ref *register-missing-ref*]
           ;; Will return an UnknownSet
           (register-missing-ref ref-data)
-          (vec (get-ref ctx ref-data)))))))
+          (ref-values (get-ref ctx ref-data)))))))
 
 (deftype DataCelMap [ctx etype ^CelMap m]
   java.util.Map
