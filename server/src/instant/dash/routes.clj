@@ -272,14 +272,16 @@
                     {:id (UUID/randomUUID)
                      :code (instant-user-magic-code-model/rand-code)
                      :user-id user-id})]
-    (when-not (config/postmark-send-enabled?)
+    (when-not (or (config/postmark-send-enabled?)
+                  (config/sendgrid-send-enabled?)
+                  (config/resend-send-enabled?))
       (log/infof (str "\n"
                       "============================================================\n"
                       "              INSTANT DASHBOARD LOGIN CODE\n"
                       "\n"
                       "                         %s\n"
                       "\n"
-                      "     Postmark is not configured. Use this code to sign in.\n"
+                      " No email provider is configured. Use this code to sign in.\n"
                       "============================================================")
                  (:code magic-code)))
     (email-router/send-structured!

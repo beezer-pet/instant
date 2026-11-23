@@ -1,11 +1,14 @@
 (ns instant.dash.routes-test
   (:require
    [clj-http.client :as http]
+   [clojure.string :as string]
    [clojure.test :refer [deftest is testing use-fixtures]]
+   [clojure.tools.logging :as log]
    [instant.config :as config]
    [instant.dash.ephemeral-app :as ephemeral-app]
    [instant.dash.get-a-db :as get-a-db]
    [instant.dash.routes :as routes]
+   [instant.email-router :as email-router]
    [instant.fixtures :refer [random-email with-empty-app with-org with-pro-app with-startup-org with-free-org with-user]]
    [instant.jdbc.aurora :as aurora]
    [instant.jdbc.sql :as sql]
@@ -35,6 +38,22 @@
 (deftest signup-outreach-does-not-run-outside-production
   (with-redefs [config/prod? (constantly false)]
     (is (nil? (routes/ping-for-outreach (random-uuid))))))
+
+(deftest login-code-is-logged-only-when-no-email-is-sent
+  (let [logs-code? (fn [providers]
+                     (let [logged (atom [])]
+                       (with-redefs [config/postmark-send-enabled? (constantly (contains? providers :postmark))
+                                     config/sendgrid-send-enabled? (constantly (contains? providers :sendgrid))
+                                     config/resend-send-enabled? (constantly (contains? providers :resend))
+                                     email-router/send-structured! (constantly nil)
+                                     log/log* (fn [_logger _level _throwable message]
+                                                (swap! logged conj message))]
+                         (routes/send-magic-code-post {:body {:email (random-email)}}))
+                       (boolean (some #(string/includes? % "LOGIN CODE") @logged))))]
+    (is (logs-code? #{}))
+    (is (not (logs-code? #{:postmark})))
+    (is (not (logs-code? #{:sendgrid})))
+    (is (not (logs-code? #{:resend})))))
 
 (deftest app-invites-work
   (with-redefs [config/postmark-send-enabled? (constantly false)]
