@@ -6612,6 +6612,128 @@
             (is (= #{"n"} (stored item note)))
             (is (= #{(str o)} (stored o owner-id)))))))))
 
+(deftest entity-that-holds-only-links-to-many
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id (test-util/make-attrs
+                      app-id
+                      [[:item/id :unique? :index?]
+                       [:item/note]
+                       [:tag/id :unique? :index?]
+                       [:box/id :unique? :index?]
+                       [:mark/id :unique? :index?]
+                       [:owner/id :unique? :index?]
+                       [[:item/tags :tag/items] :many]
+                       [[:item/marks :mark/item] :many :unique?]
+                       [[:box/item :item/boxes]]
+                       [[:owner/items :item/owner] :many :unique? :on-delete-reverse]])
+            item-id  (attr->id :item/id)
+            note     (attr->id :item/note)
+            tags     (attr->id :item/tags)
+            marks    (attr->id :item/marks)
+            box-item (attr->id :box/item)
+            owner-id (attr->id :owner/id)
+            rules!   (fn [code]
+                       (rule-model/put! (aurora/conn-pool :write) {:app-id app-id :code code}))
+            transact! (fn [tx-steps]
+                        (permissioned-tx/transact!
+                         {:db               {:conn-pool (aurora/conn-pool :write)}
+                          :app-id           app-id
+                          :attrs            (attr-model/get-by-app-id app-id)
+                          :datalog-query-fn d/query
+                          :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                          :current-user     nil}
+                         tx-steps))
+            insert!   (fn [& entities]
+                        (test-util/insert-entities app-id attr->id entities))
+            stored    (fn [eid aid]
+                        (into #{}
+                              (map last)
+                              (fetch-triples app-id [[:= :entity-id eid] [:= :attr-id aid]])))
+            tag       (random-uuid)
+            box       (random-uuid)
+            _         (insert! {:db/id tag :tag/id tag} {:db/id box :box/id box})
+            make-item! (fn []
+                         (let [item (random-uuid)]
+                           (insert! {:db/id item :item/tags tag})
+                           item))]
+        (testing "its change is checked by the update rule"
+          (rules! {:item {:allow {:create "true" :update "false"}}})
+          (testing "under its id"
+            (let [item (make-item!)]
+              (is (perm-err? (transact! [[:add-triple item note "n"]])))
+              (is (= #{} (stored item note)))))
+          (testing "under a lookup on its id"
+            (let [item (make-item!)]
+              (is (perm-err? (transact! [[:add-triple [item-id item] note "n"]])))
+              (is (= #{} (stored item note)))))
+          (testing "under a lookup on a link to many"
+            (let [item (random-uuid)
+                  mark (random-uuid)]
+              (insert! {:db/id mark :mark/id mark} {:db/id item :item/marks mark})
+              (is (perm-err? (transact! [[:add-triple [marks mark] note "n"]])))
+              (is (perm-err? (transact! [[:add-triple [marks (str mark)] note "n"]])))
+              (is (= #{} (stored item note)))
+              (rules! {:item {:allow {:create "false" :update "true"}}})
+              (is (perm-pass? (transact! [[:add-triple [marks mark] note "n"]])))
+              (is (= #{"n"} (stored item note)))
+              (rules! {:item {:allow {:create "true" :update "false"}}})))
+          (testing "and so is the retract of its link"
+            (let [item (make-item!)]
+              (is (perm-err? (transact! [[:retract-triple item tags tag]])))
+              (is (= #{tag} (stored item tags)))
+              (rules! {:item {:allow {:update "true"}}})
+              (is (perm-pass? (transact! [[:retract-triple item tags tag]])))
+              (is (= #{} (stored item tags)))
+              (rules! {:item {:allow {:create "true" :update "false"}}})))
+          (testing "and an entity that holds nothing is new"
+            (let [item (random-uuid)]
+              (is (perm-pass? (transact! [[:add-triple item note "n"]])))
+              (is (= #{"n"} (stored item note))))))
+        (testing "the rules see an entity without values"
+          (rules! {:item {:allow {:create "false"
+                                  :update "data.note == null && newData.note == 'n'"
+                                  :delete "data.id != null"}}})
+          (let [item (make-item!)]
+            (is (perm-pass? (transact! [[:add-triple item note "n"]])))
+            (is (= #{"n"} (stored item note))))
+          (let [item (make-item!)]
+            (is (perm-pass? (transact! [[:delete-entity item "item"]])))
+            (is (= #{} (stored item tags))))
+          (testing "also where a cascade deletes it"
+            (let [item  (make-item!)
+                  owner (random-uuid)]
+              (insert! {:db/id owner :owner/id owner :owner/items item})
+              (is (perm-pass? (transact! [[:delete-entity owner "owner"]])))
+              (is (= #{} (stored owner owner-id)))
+              (is (= #{} (stored item tags))))))
+        (testing "an entity with values is fetched with them under a lookup on a link to many"
+          (rules! {:item {:allow {:update "data.note == 'n'"}}})
+          (let [item (random-uuid)
+                mark (random-uuid)]
+            (insert! {:db/id mark :mark/id mark}
+                     {:db/id item :item/id item :item/note "n" :item/marks mark})
+            (is (perm-pass? (transact! [[:add-triple [marks mark] note "m"]])))
+            (is (= #{"m"} (stored item note)))
+            (is (perm-err? (transact! [[:add-triple [marks mark] note "o"]])))
+            (is (= #{"m"} (stored item note)))))
+        (testing "a link to it is checked by the view rule"
+          (let [item (make-item!)]
+            (rules! {:item {:allow {:view "false"}}})
+            (is (perm-err? (transact! [[:add-triple box box-item item]])))
+            (is (= #{} (stored box box-item)))
+            (rules! {:item {:allow {:view "true"}}})
+            (is (perm-pass? (transact! [[:add-triple box box-item item]])))
+            (is (= #{item} (stored box box-item))))
+          (testing "under a lookup on a link to many"
+            (let [item (random-uuid)
+                  mark (random-uuid)
+                  box  (random-uuid)]
+              (insert! {:db/id mark :mark/id mark} {:db/id item :item/marks mark} {:db/id box :box/id box})
+              (rules! {:item {:allow {:view "false"}}})
+              (is (perm-err? (transact! [[:add-triple box box-item [marks mark]]])))
+              (is (= #{} (stored box box-item))))))))))
+
 (deftest idle-in-transaction-error
   (with-empty-app
     (fn [{app-id   :id

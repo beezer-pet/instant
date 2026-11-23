@@ -85,6 +85,32 @@
                          triples))]
       lookups->eid)))
 
+(defn fetch-held-attrs
+  "Of the pairs `[entity-id attr-id]`, those that a triple holds, as a set."
+  [conn app-id eid+attr-ids]
+  (into #{}
+        (map (juxt :entity_id :attr_id))
+        (sql/select
+         ::fetch-held-attrs
+         conn
+         (sql/format
+          ;; The limit keeps each pair to one probe of triples_pkey. Without
+          ;; it the planner can make this a semi join, which reads all of the
+          ;; app's triples where its statistics are stale.
+          "select pairs.entity_id, pairs.attr_id
+             from unnest(?eids, ?attr-ids) as pairs (entity_id, attr_id)
+             join lateral (
+               select 1
+                 from triples
+                where triples.app_id = ?app-id
+                  and triples.entity_id = pairs.entity_id
+                  and triples.attr_id = pairs.attr_id
+                limit 1
+             ) held on true"
+          {"?app-id"   app-id
+           "?eids"     (with-meta (mapv first eid+attr-ids) {:pgtype "uuid[]"})
+           "?attr-ids" (with-meta (mapv second eid+attr-ids) {:pgtype "uuid[]"})}))))
+
 ;; ---
 ;; insert-multi!
 

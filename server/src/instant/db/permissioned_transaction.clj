@@ -152,6 +152,45 @@
       (when (= "id" (attr-model/fwd-label (attr-model/seek-by-id aid attrs)))
         (uuid-util/coerce value)))))
 
+(defn- many-valued-entities
+  "Of the entities that are fetched as nothing, those that hold values of their
+   etype's attributes with many values, each as an entity of its id alone:
+   an entity named by its id, and one that a lookup on such an attribute finds."
+  [{:keys [attrs app-id db]} entities]
+  (let [many-ids  (memoize
+                   (fn [etype]
+                     (into #{}
+                           (remove (attr-model/ea-ids-for-etype etype attrs))
+                           (attr-model/attr-ids-for-etype etype attrs))))
+        unfound   (for [[{:keys [etype] :as key} entity] entities
+                        :when (and (nil? entity)
+                                   (seq (many-ids etype)))]
+                    key)
+        by-id     (filter #(uuid? (:eid %)) unfound)
+        by-lookup (filter (fn [{:keys [eid etype]}]
+                            (and (lookup-ref? eid)
+                                 (contains? (many-ids etype) (first eid))))
+                          unfound)
+        held      (when (seq by-id)
+                    (triple-model/fetch-held-attrs (:conn-pool db)
+                                                   app-id
+                                                   (for [{:keys [eid etype]} by-id
+                                                         aid                 (many-ids etype)]
+                                                     [eid aid])))
+        found     (when (seq by-lookup)
+                    (triple-model/fetch-lookups->eid (:conn-pool db)
+                                                     app-id
+                                                     (map :eid by-lookup)))]
+    (into {}
+          (concat
+           (for [{:keys [eid etype] :as key} by-id
+                 :when (some #(held [eid %]) (many-ids etype))]
+             [key {"id" eid}])
+           (for [{:keys [eid] :as key} by-lookup
+                 :let [id (get found eid)]
+                 :when id]
+             [key {"id" id}])))))
+
 (defn load-entities-map
   "Takes tx-steps, fetches from DB map of
 
@@ -159,7 +198,10 @@
 
    A lookup on an id attribute that finds no entity is given the entity of
    that id, which can hold values of the etype's attributes with one value
-   without its id."
+   without its id.
+
+   An entity that holds only values of its etype's attributes with many
+   values is `{\"id\" eid}`."
   [{:keys [datalog-query-fn attrs] :as ctx} tx-steps]
   (let [;; An entity appears in one tx-step per attribute written, so fetch
         ;; each entity once rather than once per step.
@@ -200,7 +242,8 @@
                                   triples (mapcat identity rows)]]
                         (when (seq triples)
                           (-> (entity-model/triples->map ctx triples)
-                              (assoc "id" (ffirst triples))))))]
+                              (assoc "id" (ffirst triples))))))
+            entities (merge entities (many-valued-entities ctx entities))]
         (if (seq id-keys)
           (into {}
                 (for [key eids+etypes]
