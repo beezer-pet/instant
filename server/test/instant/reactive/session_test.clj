@@ -3,6 +3,7 @@
    [clojure.core.async :as a]
    [clojure.java.io :as io]
    [clojure.set :as set]
+   [clojure.string :as string]
    [clojure.test :as test :refer [deftest is testing]]
    [datascript.core :as ds]
    [instant.config :as config]
@@ -22,16 +23,17 @@
    [instant.model.app-stream :as app-stream-model]
    [instant.model.rule :as rule-model]
    [instant.reactive.ephemeral :as eph]
+   [instant.reactive.invalidator :as inv]
    [instant.reactive.query :as rq]
    [instant.reactive.receive-queue :as receive-queue]
    [instant.reactive.session :as session]
    [instant.reactive.store :as rs]
+   [instant.reactive.topics :as topics]
    [instant.storage.s3 :as s3]
    [instant.util.async :as ua]
    [instant.util.cache :as cache]
    [instant.util.coll :as ucoll]
    [instant.util.exception :as ex]
-   [instant.util.json :as json]
    [instant.util.test :as test-util])
   (:import
    (com.hazelcast.core HazelcastInstance)
@@ -753,7 +755,9 @@
                                                                         :movie/id
                                                                         :movie/trivia
                                                                         :movie/title}]]}],
-                           :join-sym ?movie-0}}]}}}
+                           :join-sym ?movie-0}
+                          :topic-scope {:sym ?movie-0
+                                        :links #{[:movie/director "eid-john-mctiernan"]}}}]}}}
                    (->> (get-datalog-cache-for-app store app-id)
                         (resolvers/walk-friendly r)
                         keys
@@ -768,7 +772,9 @@
                                                                          :movie/id
                                                                          :movie/trivia
                                                                          :movie/title}]]}],
-                            :join-sym ?movie-0}}]}}}}
+                            :join-sym ?movie-0}
+                           :topic-scope {:sym ?movie-0
+                                         :links #{[:movie/director "eid-john-mctiernan"]}}}]}}}}
                    (->> (get-subscriptions-for-app-id store app-id)
                         (resolvers/walk-friendly r)
                         pretty-subs)))
@@ -809,7 +815,9 @@
                                                                         :movie/id
                                                                         :movie/trivia
                                                                         :movie/title}]]}],
-                           :join-sym ?movie-0}}]}}}
+                           :join-sym ?movie-0}
+                          :topic-scope {:sym ?movie-0
+                                        :links #{[:movie/director "eid-john-mctiernan"]}}}]}}}
                    (->> (get-datalog-cache-for-app store app-id)
                         (resolvers/walk-friendly r)
                         keys
@@ -824,7 +832,9 @@
                                                                          :movie/id
                                                                          :movie/trivia
                                                                          :movie/title}]]}],
-                            :join-sym ?movie-0}}]}}}}
+                            :join-sym ?movie-0}
+                           :topic-scope {:sym ?movie-0
+                                         :links #{[:movie/director "eid-john-mctiernan"]}}}]}}}}
                    (->> (get-subscriptions-for-app-id store app-id)
                         (resolvers/walk-friendly r)
                         pretty-subs)))))))))
@@ -1727,44 +1737,46 @@
 ;; ----------------------------------------------
 ;; Which writes refresh a permissioned query
 
-(defn- triple-topics
-  "The topics that the invalidator produces for the stored triples of `e` `a`."
-  [app-id e a]
-  (->> (sql/select ::triple-topics
+(defn- entity-topics
+  "The topics that the invalidator produces for the stored triples of `eids`."
+  [app-id eids]
+  (->> (sql/select ::entity-topics
                    (aurora/conn-pool :read)
-                   ["select cast(value as text) as value, ea, eav, av, ave, vae
+                   ["select entity_id, attr_id, cast(value as text) as value,
+                            cast(checked_data_type as text) as checked_data_type,
+                            ea, eav, av, ave, vae
                        from triples
-                      where app_id = ?::uuid and entity_id = ?::uuid and attr_id = ?::uuid"
-                    app-id e a])
-       (map (fn [{:keys [value] :as row}]
-              (let [v (json/<-json value)]
-                [(set (filter row [:ea :eav :av :ave :vae]))
-                 #{e}
-                 #{a}
-                 #{(if (:eav row) (parse-uuid v) v)}])))
+                      where app_id = ?::uuid and entity_id = any(?::uuid[])"
+                    app-id
+                    (with-meta (vec eids) {:pgtype "uuid[]"})])
+       (map (fn [row]
+              [(set (filter row [:ea :eav :av :ave :vae]))
+               #{(:entity_id row)}
+               #{(:attr_id row)}
+               #{(topics/parse-v row)}]))
        set))
 
 (defn- transact-topics!
-  "Transacts `tx-steps`, which must only change triples of `e` `a`, and returns
+  "Transacts `tx-steps`, which must only change triples of `eids`, and returns
    the topics that the invalidator would produce for the change."
-  [app-id e a tx-steps]
-  (let [before (triple-topics app-id e a)
+  [app-id eids tx-steps]
+  (let [before (entity-topics app-id eids)
         _ (tx/transact! (aurora/conn-pool :write)
                         (attr-model/get-by-app-id app-id)
                         app-id
                         tx-steps)
-        after (triple-topics app-id e a)]
+        after (entity-topics app-id eids)]
     (set/difference (set/union before after)
                     (set/intersection before after))))
 
-(defn- refreshed-by?
+(defn- refreshed-by-write?
   "Subscribes to `q`, makes the write, and returns whether the write marked `q`
    stale. Unsubscribes afterwards so that the next check starts fresh."
-  [store {:keys [socket app-id tx-counter]} q [e a tx-steps]]
+  [store {:keys [socket app-id tx-counter]} q [eids tx-steps]]
   (let [sess-id (:id socket)
         _ (blocking-send-msg :add-query-ok socket {:op :add-query :q q})
         _ (is (empty? (rs/get-stale-instaql-queries store app-id sess-id)))
-        topics (transact-topics! app-id e a tx-steps)
+        topics (transact-topics! app-id eids tx-steps)
         _ (is (seq topics) "the write must change a triple")
         tx-id (swap! tx-counter inc)
         _ (rs/mark-stale-topics! store app-id tx-id (instant.isn/test-isn tx-id) topics {})
@@ -1773,6 +1785,11 @@
                           q)]
     (blocking-send-msg :remove-query-ok socket {:op :remove-query :q q})
     stale?))
+
+(defn- refreshed-by?
+  "`refreshed-by-write?` for a write to one entity, as `[e a tx-steps]`."
+  [store sess q [e _a tx-steps]]
+  (refreshed-by-write? store sess q [[e] tx-steps]))
 
 (defn- with-permissioned-session [rules f]
   (with-session
@@ -1904,3 +1921,317 @@
           (testing "a field of the row that the rule doesn't read"
             (is (not (refreshed-by? store sess q [book (resolvers/->uuid r :books/pageCount)
                                                   [[:add-triple book (resolvers/->uuid r :books/pageCount) 1]]])))))))))
+
+;; ----------------------------------------------
+;; Which writes refresh a query that names a link
+
+(def ^:private early "2026-01-10T10:00:00Z")
+(def ^:private cutoff "2026-02-01T00:00:00Z")
+(def ^:private late "2026-03-10T10:00:00Z")
+
+(defn- with-tasks-session
+  "Calls `f` with a session on an app that has projects, tasks that link to
+   a project, and notes that link to a task, and with:
+
+     `store`      the session's store
+     `sess`       the session, as `refreshed-by-write?` takes it
+     `ids`        the attr ids by name, as `:tasks/status`
+     `transact!`  transacts tx-steps
+     `entity!`    creates an entity of an etype with the fields and returns its id
+     `create`     the write that `entity!` makes, for an id
+     `set-field`  the write that sets a field of an entity
+     `refreshed?` `refreshed-by-write?` for a query and a write"
+  [f]
+  (with-session
+    (fn [store {:keys [socket zeneca-app-id]}]
+      (let [app-id zeneca-app-id
+            ids (test-util/make-attrs
+                 app-id
+                 [[:projects/id :unique? :index?]
+                  [:tasks/id :unique? :index?]
+                  [:tasks/status :index? :string]
+                  [:tasks/dueAt :index? :date]
+                  [:tasks/doneAt :index? :date]
+                  [:tasks/rank :index? :number]
+                  [:tasks/title]
+                  [[:tasks/project :projects/tasks]]
+                  [:notes/id :unique? :index?]
+                  [:notes/text :index? :string]
+                  [[:notes/task :tasks/notes]]])
+            sess {:socket socket :app-id app-id :tx-counter (atom 0)}
+            create (fn [etype id fields]
+                     [[id] (into [[:add-triple id (ids (keyword etype "id")) (str id)]]
+                                 (for [[k v] fields]
+                                   [:add-triple id (ids (keyword etype (name k))) v]))])
+            transact! (fn [tx-steps]
+                        (tx/transact! (aurora/conn-pool :write)
+                                      (attr-model/get-by-app-id app-id)
+                                      app-id
+                                      tx-steps))
+            entity! (fn [etype fields]
+                      (let [id (random-uuid)]
+                        (transact! (second (create etype id fields)))
+                        id))]
+        (blocking-send-msg :init-ok socket {:op :init :app-id app-id})
+        (rs/transact! "store/reset-tx-id"
+                      (rs/app-conn store app-id)
+                      [[:db.fn/call (fn [db]
+                                      [[:db/add (ds/entid db [:tx-meta/app-id app-id]) :tx-meta/processed-tx-id 0]
+                                       [:db/add (ds/entid db [:tx-meta/app-id app-id]) :tx-meta/processed-isn (instant.isn/test-isn 0)]])]])
+        (f {:store store
+            :sess sess
+            :ids ids
+            :transact! transact!
+            :entity! entity!
+            :create create
+            :set-field (fn [id attr v]
+                         [[id] [[:add-triple id (ids attr) v]]])
+            :refreshed? (fn [q write]
+                          (refreshed-by-write? store sess q write))})))))
+
+(deftest link-wheres-refresh-for-each-clause
+  (with-tasks-session
+    (fn [{:keys [entity! set-field refreshed?]}]
+      (let [project (entity! "projects" {})
+            other (entity! "projects" {})
+            _ (entity! "tasks" {:project project :status "open"})
+            link (str project)]
+        (doseq [where [{:and [{:status "open"} {"project.id" link}]}
+                       {:and [{"project.id" link} {:status "open"}]}
+                       (array-map :status "open" "project.id" link)
+                       (array-map "project.id" link :status "open")
+                       {:status "open" :project link}]
+                :let [q {:tasks {:$ {:where where}}}]]
+          (testing (pr-str where)
+            (testing "a task of the project comes into the list"
+              (is (refreshed? q (set-field (entity! "tasks" {:project project :status "done"})
+                                           :tasks/status "open"))))
+            (testing "a task of another project doesn't"
+              (is (not (refreshed? q (set-field (entity! "tasks" {:project other :status "done"})
+                                                :tasks/status "open")))))))))))
+
+(deftest link-wheres-refresh-for-what-enters-and-leaves
+  (with-tasks-session
+    (fn [{:keys [ids entity! create set-field refreshed?]}]
+      (let [project (entity! "projects" {})
+            other (entity! "projects" {})
+            task! (fn [project fields]
+                    (entity! "tasks" (assoc fields :project project)))
+            held (task! project {:status "open" :dueAt early})
+            q {:tasks {:$ {:where {:and [{:status {:$in ["open" "started"]}}
+                                         {:dueAt {:$lt cutoff}}
+                                         {"project.id" (str project)}]}}}}
+            relink (fn [task project]
+                     [[task] [[:add-triple task (:tasks/project ids) project]]])]
+        (testing "a date moves into the range"
+          (is (refreshed? q (set-field (task! project {:status "open" :dueAt late})
+                                       :tasks/dueAt early)))
+          (is (refreshed? {:tasks {:$ {:where {:and [{:status "open"}
+                                                     {:dueAt {:$gte cutoff}}
+                                                     {"project.id" (str project)}]}}}}
+                          (set-field (task! project {:status "open" :dueAt early})
+                                     :tasks/dueAt late))))
+        (testing "a date moves out of the range"
+          (is (refreshed? q (set-field (task! project {:status "open" :dueAt early})
+                                       :tasks/dueAt late))))
+        (testing "a task is linked to the project"
+          (is (refreshed? q (relink (task! other {:status "open" :dueAt early}) project))))
+        (testing "a task is linked to another project"
+          (is (refreshed? q (relink (task! project {:status "open" :dueAt early}) other))))
+        (testing "a task is unlinked from the project"
+          (let [task (task! project {:status "open" :dueAt early})]
+            (is (refreshed? q [[task] [[:retract-triple task (:tasks/project ids) project]]]))))
+        (testing "a task is created in the project"
+          (is (refreshed? q (create "tasks" (random-uuid) {:project project :status "open" :dueAt early}))))
+        (testing "a task of the project is deleted"
+          (let [task (task! project {:status "open" :dueAt early})]
+            (is (refreshed? q [[task] [[:delete-entity task "tasks"]]]))))
+        (testing "the project of a task is deleted"
+          (let [gone (entity! "projects" {})
+                task (task! gone {:status "open" :dueAt early})]
+            (is (refreshed? {:tasks {:$ {:where {:and [{:status "open"} {"project.id" (str gone)}]}}}}
+                            [[gone task] [[:delete-entity gone "projects"]]]))))
+        (testing "a field that the where doesn't name"
+          (is (refreshed? q (set-field held :tasks/title "Held")))
+          (is (not (refreshed? q (set-field (task! project {:status "done" :dueAt early})
+                                            :tasks/title "Not held")))))
+        (testing "tasks of another project"
+          (let [task (task! other {:status "open" :dueAt late})]
+            (is (not (refreshed? q (set-field task :tasks/dueAt early))))
+            (is (not (refreshed? q (set-field task :tasks/status "done"))))
+            (is (not (refreshed? q [[task] [[:delete-entity task "tasks"]]])))
+            (is (not (refreshed? q (create "tasks" (random-uuid) {:project other :status "open" :dueAt early}))))))
+        (testing "$isNull"
+          (let [q {:tasks {:$ {:where {:and [{:status "open"}
+                                             {:doneAt {:$isNull false}}
+                                             {"project.id" (str project)}]}}}}
+                finish (fn [project]
+                         (set-field (task! project {:status "open"}) :tasks/doneAt early))]
+            (is (refreshed? q (finish project)))
+            (is (not (refreshed? q (finish other))))))
+        (testing "$isNull of a link from the other side"
+          (let [q {:tasks {:$ {:where {:and [{:notes {:$isNull true}}
+                                             {"project.id" (str project)}]}}}}
+                note (entity! "notes" {:text "a"})]
+            (is (refreshed? q [[note] [[:add-triple note (:notes/task ids) held]]]))))
+        (testing "$in of links"
+          (let [third (entity! "projects" {})
+                q {:tasks {:$ {:where {:status "open"
+                                       "project.id" {:$in [(str project) (str other)]}}}}}
+                open (fn [project]
+                       (set-field (task! project {:status "done"}) :tasks/status "open"))]
+            (is (refreshed? q (open project)))
+            (is (refreshed? q (open other)))
+            (is (not (refreshed? q (open third))))))))))
+
+(deftest link-wheres-refresh-with-ors
+  (with-tasks-session
+    (fn [{:keys [entity! set-field refreshed?]}]
+      (let [project (entity! "projects" {})
+            other (entity! "projects" {})
+            link (str project)
+            _ (entity! "tasks" {:project project :status "open" :dueAt early})
+            open (fn [project]
+                   (set-field (entity! "tasks" {:project project :status "done" :dueAt late})
+                              :tasks/status "open"))
+            due (fn [project]
+                  (set-field (entity! "tasks" {:project project :status "done" :dueAt late})
+                             :tasks/dueAt early))]
+        (testing "an or of and-lists that each name the link"
+          (let [q {:tasks {:$ {:where {:or [{:and [{:status "open"} {"project.id" link}]}
+                                            {:and [{:dueAt {:$lt cutoff}} {"project.id" link}]}]}}}}]
+            (is (refreshed? q (open project)))
+            (is (refreshed? q (due project)))
+            (is (not (refreshed? q (open other))))
+            (is (not (refreshed? q (due other))))))
+        (testing "an or beside the link"
+          (let [q {:tasks {:$ {:where {:and [{"project.id" link}
+                                             {:or [{:status "open"} {:dueAt {:$lt cutoff}}]}]}}}}]
+            (is (refreshed? q (open project)))
+            (is (refreshed? q (due project)))
+            (is (not (refreshed? q (open other))))
+            (is (not (refreshed? q (due other))))))
+        (testing "an or of and-lists that name different links"
+          (let [third (entity! "projects" {})
+                q {:tasks {:$ {:where {:or [{:and [{:status "open"} {"project.id" link}]}
+                                            {:and [{:dueAt {:$lt cutoff}} {"project.id" (str other)}]}]}}}}]
+            (is (refreshed? q (open project)))
+            (is (refreshed? q (due other)))
+            (is (not (refreshed? q (open third))))
+            (is (not (refreshed? q (due third))))))
+        (testing "an or with a list that doesn't name the link is for every project"
+          (let [q {:tasks {:$ {:where {:or [{:and [{:dueAt {:$lt cutoff}} {"project.id" link}]}
+                                            {:status "open"}]}}}}]
+            (is (refreshed? q (open other)))))))))
+
+(deftest link-wheres-refresh-pages-children-and-paths
+  (with-tasks-session
+    (fn [{:keys [ids entity! create set-field refreshed?]}]
+      (let [project (entity! "projects" {})
+            other (entity! "projects" {})
+            link (str project)]
+        (testing "a list that is empty"
+          (let [q {:tasks {:$ {:where {:and [{:status "started"} {"project.id" link}]}}}}
+                start (fn [project]
+                        (set-field (entity! "tasks" {:project project :status "done"})
+                                   :tasks/status "started"))]
+            (is (not (refreshed? q (start other))))
+            (is (refreshed? q (start project)))))
+        (testing "an ordered list with a limit"
+          (let [q {:tasks {:$ {:where {"project.id" link}
+                               :order {:rank :desc}
+                               :limit 1}}}
+                _ (entity! "tasks" {:project project :rank 5})
+                _ (entity! "tasks" {:project project :rank 4})
+                raise (fn [project]
+                        (set-field (entity! "tasks" {:project project :rank 1})
+                                   :tasks/rank 9))]
+            (is (refreshed? q (raise project)))
+            (is (not (refreshed? q (raise other))))))
+        (testing "a list with children"
+          (let [q {:tasks {:$ {:where {:and [{:status "open"} {"project.id" link}]}}
+                           :notes {}}}
+                held (entity! "tasks" {:project project :status "open"})]
+            (is (refreshed? q (set-field (entity! "tasks" {:project project :status "done"})
+                                         :tasks/status "open")))
+            (is (refreshed? q (create "notes" (random-uuid) {:task held :text "a"})))
+            (is (not (refreshed? q (set-field (entity! "tasks" {:project other :status "done"})
+                                              :tasks/status "open"))))))
+        (testing "a clause through another link"
+          (let [q {:tasks {:$ {:where {:and [{"notes.text" "urgent"} {"project.id" link}]}}}}
+                task (entity! "tasks" {:project project})
+                note (entity! "notes" {:task task :text "later"})
+                loose (entity! "notes" {:text "urgent"})]
+            (is (refreshed? q (set-field note :notes/text "urgent")))
+            (is (refreshed? q [[loose] [[:add-triple loose (:notes/task ids) (entity! "tasks" {:project project})]]]))
+            (testing "and is for the notes of every project"
+              (is (refreshed? q (set-field (entity! "notes" {:task (entity! "tasks" {:project other})
+                                                             :text "later"})
+                                           :notes/text "urgent"))))))))))
+
+(deftest link-wheres-refresh-for-many-rows
+  (with-tasks-session
+    (fn [{:keys [ids transact! entity! create refreshed?]}]
+      (let [project (entity! "projects" {})
+            other (entity! "projects" {})
+            q {:tasks {:$ {:where {:and [{:status "open"} {"project.id" (str project)}]}}}}
+            open-all (fn [project]
+                       (let [tasks (vec (repeatedly 300 random-uuid))]
+                         (transact! (mapcat #(second (create "tasks" % {:project project :status "done"}))
+                                            tasks))
+                         [tasks (for [task tasks]
+                                  [:add-triple task (:tasks/status ids) "open"])]))]
+        (is (not (refreshed? q (open-all other))))
+        (is (refreshed? q (open-all project)))))))
+
+(deftest link-wheres-refresh-with-each-matcher
+  (with-tasks-session
+    (fn [{:keys [entity! set-field refreshed?]}]
+      (let [project (entity! "projects" {})
+            other (entity! "projects" {})
+            q {:tasks {:$ {:where {:and [{"project.id" (str project)} {:status "open"}]}}}}
+            open (fn [project]
+                   (set-field (entity! "tasks" {:project project :status "done"})
+                              :tasks/status "open"))]
+        (doseq [[v3? v2?] [[true true] [false true] [false false]]]
+          (with-redefs [flags/use-get-datalog-queries-for-topics-v3? (constantly v3?)
+                        flags/use-get-datalog-queries-for-topics-v2? (constantly v2?)]
+            (is (refreshed? q (open project)))
+            (is (not (refreshed? q (open other))))))))))
+
+(deftest link-wheres-refresh-through-the-invalidator
+  (with-tasks-session
+    (fn [{:keys [store sess ids entity! transact!]}]
+      (let [{:keys [socket app-id]} sess
+            project (entity! "projects" {})
+            other (entity! "projects" {})
+            task (entity! "tasks" {:project project :status "done"})
+            other-task (entity! "tasks" {:project other :status "done"})
+            q {:tasks {:$ {:where {:and [{"project.id" (str project)} {:status "open"}]}}}}
+            invalidate! (var-get #'inv/invalidate!)
+            handled (atom 0)
+            machine-id (string/replace (str "test-" (random-uuid)) #"-" "_")
+            open! (fn [task]
+                    (let [before @handled]
+                      (transact! [[:add-triple task (:tasks/status ids) "open"]])
+                      (test-util/wait-for #(< before @handled) 5000)))
+            stale? (fn []
+                     (boolean (seq (rs/get-stale-instaql-queries store app-id (:id socket)))))]
+        ;; The invalidator marks the session's store for the app's writes
+        ;; and sends no refresh.
+        (with-redefs [inv/invalidate!
+                      (fn [process-id global-store wal-record]
+                        (if (and (= machine-id process-id) (= app-id (:app-id wal-record)))
+                          (do (invalidate! process-id store wal-record)
+                              (swap! handled inc)
+                              {:sockets [] :sync-subs []})
+                          (invalidate! process-id global-store wal-record)))]
+          (let [process (inv/start machine-id)]
+            (try
+              (blocking-send-msg :add-query-ok socket {:op :add-query :q q})
+              (open! other-task)
+              (is (not (stale?)))
+              (open! task)
+              (is (stale?))
+              (finally
+                (inv/stop process)))))))))

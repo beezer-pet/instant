@@ -3,9 +3,12 @@
    [clojure.set]
    [instant.db.model.attr :as attr-model]
    [instant.db.model.triple :as triple-model]
+   [instant.jdbc.aurora :as aurora]
+   [instant.jdbc.sql :as sql]
    [instant.util.coll :as ucoll]
    [instant.util.json :refer [<-json]]
    [instant.util.memoize :refer [vmemoize]]
+   [instant.util.tracer :as tracer]
    [medley.core :as medley])
   (:import
    (java.util UUID)))
@@ -202,6 +205,82 @@
                                   topics-for-triple-changes
                                   topics-for-attr-changes)]
     topics))
+
+;; -----
+;; Links
+
+(defn- stored-links
+  "Of `links`, each `[attr-id value]`, those that each of the entities
+   holds, by entity id."
+  [app-id eids links]
+  (reduce (fn [acc {:keys [entity_id attr_id value]}]
+            (let [link [attr_id value]]
+              (if (contains? links link)
+                (update acc entity_id (fnil conj #{}) link)
+                acc)))
+          {}
+          (sql/select ::stored-links
+                      (aurora/conn-pool :read)
+                      ["select entity_id, attr_id, json_uuid_to_uuid(value) as value
+                          from triples
+                         where app_id = ?::uuid
+                           and entity_id = any(?::uuid[])
+                           and attr_id = any(?::uuid[])
+                           and json_uuid_to_uuid(value) = any(?::uuid[])
+                           and eav"
+                       app-id
+                       (with-meta (vec eids) {:pgtype "uuid[]"})
+                       (with-meta (into [] (comp (map first) (distinct)) links)
+                         {:pgtype "uuid[]"})
+                       (with-meta (into [] (comp (map second) (distinct)) links)
+                         {:pgtype "uuid[]"})])))
+
+(defn- changed-links
+  "Of `links`, those that the topics put on each entity or take from it, by
+   entity id."
+  [topics links]
+  (reduce (fn [acc [_idx e a v]]
+            (if-let [e-links (and (set? e) (set? a) (set? v)
+                                  (seq (for [attr-id a
+                                             value v
+                                             :when (contains? links [attr-id value])]
+                                         [attr-id value])))]
+              (reduce (fn [acc eid]
+                        (update acc eid (fnil into #{}) e-links))
+                      acc
+                      e)
+              acc))
+          {}
+          topics))
+
+(defn with-links
+  "Adds to the entities of each topic those of `links`, each `[attr-id
+   value]`, that the entities hold or that the topics put on them or take
+   from them, so that the topic of a query that is scoped to a link matches
+   a change to any entity that holds the link. If the links can't be read,
+   the topics are for every entity."
+  [app-id topics links]
+  (let [eids (into #{}
+                   (comp (map second) (filter set?) cat)
+                   topics)]
+    (if (or (empty? links) (empty? eids))
+      topics
+      (try
+        (let [links-by-eid (merge-with into
+                                       (stored-links app-id eids links)
+                                       (changed-links topics links))]
+          (into #{}
+                (map (fn [[idx e a v :as topic]]
+                       (if-let [e-links (and (set? e) (seq (mapcat links-by-eid e)))]
+                         [idx (into e e-links) a v]
+                         topic)))
+                topics))
+        (catch Throwable t
+          (tracer/record-exception-span! t {:name "topics/with-links-error"
+                                            :escaping? false})
+          (into #{}
+                (map (fn [topic] (assoc topic 1 '_)))
+                topics))))))
 
 ;; Wal entities
 ;; ------------

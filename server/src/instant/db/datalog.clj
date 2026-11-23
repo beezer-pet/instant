@@ -343,9 +343,13 @@
   (s/or :constant (s/coll-of v-type :kind set? :min-count 1)
         :any #{'_}))
 
+;; A link, `[attr-id value]`, stands for the entities that hold it.
+(s/def ::topic-link (s/tuple uuid? uuid?))
+
 (s/def ::topic
   (s/cat :idx ::triple-model/index
-         :e (topic-component uuid?)
+         :e (topic-component (s/or :entity uuid?
+                                   :link ::topic-link))
          :a (topic-component uuid?)
          :v (topic-component ::triple-model/value)))
 
@@ -2772,6 +2776,7 @@
                                    :aggregate (:aggregate pattern-group)
                                    :datalog-query (:datalog-query pattern-group)
                                    :topic-symbol-values (:topic-symbol-values pattern-group)
+                                   :topic-scope (:topic-scope pattern-group)
                                    :table (:from query)}))
                       (let [join-sym (get-in pattern-group [:children :join-sym])
                             join-cte [(kw prefix next-idx)
@@ -2796,6 +2801,7 @@
                                                      :page-info (:page-info pattern-group)
                                                      :datalog-query (:datalog-query pattern-group)
                                                      :topic-symbol-values (:topic-symbol-values pattern-group)
+                                                     :topic-scope (:topic-scope pattern-group)
                                                      :children {:pattern-groups (:pattern-groups child-res)
                                                                 :join-sym join-sym}}))))))))
               acc
@@ -3142,6 +3148,34 @@
           []
           pattern-metas))
 
+;; A group can set `:topic-scope` to `{:sym sym :links links}` when every
+;; entity `sym` can match holds one of `links`, each `[attr-id value]`. Its
+;; topics are then built from the patterns alone: a pattern on `sym` is
+;; limited to the entities that hold one of the links, which the
+;; invalidator resolves for the entities a transaction changed, and every
+;; other symbol is a wildcard.
+(defn- scoped-topics [pattern-metas {:keys [sym links] :as scope}]
+  (reduce (fn [acc {:keys [pattern] :as pattern-meta}]
+            (if-let [ors (:or pattern-meta)]
+              (reduce (fn [acc pattern-metas]
+                        (into acc (scoped-topics pattern-metas scope)))
+                      acc
+                      ors)
+              (let [[topic null-topic] (named-pattern->topics pattern {})
+                    [v-tag v-value] (:v pattern)]
+                (if (not= [:variable sym] (:e pattern))
+                  (cond-> (conj acc topic)
+                    null-topic (conj null-topic))
+                  (cond-> (conj acc (assoc topic 1 links))
+                    ;; The triple a reverse $isNull tests is held by the
+                    ;; entity on the other side of the link.
+                    null-topic (conj (if (and (= :function v-tag)
+                                              (:reverse? (:$isNull v-value)))
+                                       null-topic
+                                       (assoc null-topic 1 links))))))))
+          []
+          pattern-metas))
+
 (declare cols-for-sym)
 
 (defn- with-matches
@@ -3367,6 +3401,11 @@
                                    (not coarse-topics?))
                               (assoc :topics (seeded-topics transformed-pattern-metas
                                                             (:topic-symbol-values group)))
+
+                              (and (:topic-scope group)
+                                   (not coarse-topics?))
+                              (assoc :topics (scoped-topics transformed-pattern-metas
+                                                            (:topic-scope group)))
 
                               coarse-topics? (assoc :topics (pats->coarse-topics (:datalog-query group))))
                      datalog-query (if join-sym

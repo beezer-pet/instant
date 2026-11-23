@@ -271,3 +271,39 @@
                              :handle "alex",
                              :id "eid-alex",
                              :email "alex@instantdb.com"}}}))))))))
+
+(deftest with-links-adds-the-links-of-entities
+  (with-zeneca-app
+    (fn [app r]
+      (let [app-id (:id app)
+            stopa (resolvers/->uuid r "eid-stepan-parunashvili")
+            alex (resolvers/->uuid r "eid-alex")
+            worldview (resolvers/->uuid r "eid-worldview")
+            shelves (resolvers/->uuid r :users/bookshelves)
+            handle (resolvers/->uuid r :users/handle)
+            link [shelves worldview]
+            renamed (fn [user]
+                      [#{:ea :av} #{user} #{handle} #{"renamed"}])]
+        (testing "a link that an entity holds"
+          (is (= #{[#{:ea :av} #{stopa link} #{handle} #{"renamed"}]}
+                 (topics/with-links app-id #{(renamed stopa)} #{link}))))
+        (testing "a link that the topics take from an entity"
+          (is (= #{[#{:ea :eav :vae} #{alex link} #{shelves} #{worldview}]
+                   [#{:ea :av} #{alex link} #{handle} #{"renamed"}]}
+                 (topics/with-links app-id
+                                    #{[#{:ea :eav :vae} #{alex} #{shelves} #{worldview}]
+                                      (renamed alex)}
+                                    #{link}))))
+        (testing "only the links asked for"
+          (is (= #{(renamed alex)}
+                 (topics/with-links app-id #{(renamed alex)} #{link})))
+          (is (= #{(renamed stopa)}
+                 (topics/with-links app-id #{(renamed stopa)} #{}))))
+        (testing "topics for every entity stay as they are"
+          (let [topics '#{[#{:av :ea :eav :vae :ave} _ #{#uuid "a684c2ba-27af-4d54-8c02-68832b4566f0"} _]}]
+            (is (= topics (topics/with-links app-id topics #{link})))))
+        (testing "topics are for every entity when the links can't be read"
+          (with-redefs-fn {#'topics/stored-links (fn [& _] (throw (ex-info "no connection" {})))}
+            (fn []
+              (is (= #{[#{:ea :av} '_ #{handle} #{"renamed"}]}
+                     (topics/with-links app-id #{(renamed stopa)} #{link}))))))))))

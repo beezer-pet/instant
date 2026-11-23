@@ -3871,13 +3871,34 @@
         (testing "forward works on link name"
           (is-pretty-eq?
            (query-pretty {:users {:$ {:where {:bookshelves (resolvers/->uuid r "eid-worldview")}}}})
-           '({:topics ([#{:vae} _ #{:users/bookshelves} #{"eid-worldview"}]
+           '({:topics ([#{:vae} #{[:users/bookshelves "eid-worldview"]} #{:users/bookshelves} #{"eid-worldview"}]
                        --
                        [#{:ea} #{"eid-stepan-parunashvili"}
                         #{:users/createdAt :users/email :users/id :users/fullName
                           :users/handle} _])
               :triples
               (("eid-stepan-parunashvili" :users/bookshelves "eid-worldview")
+               --
+               ("eid-stepan-parunashvili" :users/email "stopa@instantdb.com")
+               ("eid-stepan-parunashvili" :users/createdAt "2021-01-07 18:50:43.447955")
+               ("eid-stepan-parunashvili" :users/fullName "Stepan Parunashvili")
+               ("eid-stepan-parunashvili" :users/handle "stopa")
+               ("eid-stepan-parunashvili" :users/id "eid-stepan-parunashvili"))})))
+        (testing "the clauses beside a link are for the entities that hold the link"
+          (is-pretty-eq?
+           (query-pretty {:users {:$ {:where {:handle "stopa"
+                                              :bookshelves.id (resolvers/->uuid r "eid-worldview")}}}})
+           '({:topics ([#{:av} #{[:users/bookshelves "eid-worldview"]} #{:users/handle} #{"stopa"}]
+                       [#{:av} _ #{:bookshelves/id} #{"eid-worldview"}]
+                       [#{:vae} #{[:users/bookshelves "eid-worldview"]} #{:users/bookshelves} _]
+                       --
+                       [#{:ea} #{"eid-stepan-parunashvili"}
+                        #{:users/createdAt :users/email :users/id :users/fullName
+                          :users/handle} _])
+              :triples
+              (("eid-stepan-parunashvili" :users/handle "stopa")
+               ("eid-worldview" :bookshelves/id "eid-worldview")
+               ("eid-stepan-parunashvili" :users/bookshelves "eid-worldview")
                --
                ("eid-stepan-parunashvili" :users/email "stopa@instantdb.com")
                ("eid-stepan-parunashvili" :users/createdAt "2021-01-07 18:50:43.447955")

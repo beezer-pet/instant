@@ -894,6 +894,35 @@
           datalog-query
           (conj referenced-etypes etype))))
 
+(defn- topic-links
+  "Links, each `[attr-id value]`, of which every entity that matches the
+   where-conds holds one, or nil if the where-conds name no such links. A
+   cond gives them when it matches a link of the etype by id, as
+   `{\"owner.id\" id}` does, an `and` when one of its conds does, and an
+   `or` when each of its conds does."
+  [{:keys [attrs] :as ctx} etype where-conds]
+  (some (fn [[tag where-cond]]
+          (case tag
+            :cond (let [{:keys [path v]} where-cond
+                        [v-tag v-value] v
+                        ids (case v-tag
+                              :value [v-value]
+                              :args-map (some v-value [:$in :in]))
+                        attr (attr-model/seek-by-fwd-ident-name [etype (first path)] attrs)]
+                    (when (and (= :ref (:value-type attr))
+                               (or (= 1 (count path))
+                                   (= ["id"] (rest path)))
+                               (seq ids)
+                               (every? uuid-util/coerce ids))
+                      (into #{}
+                            (map (fn [id] [(:id attr) (uuid-util/coerce id)]))
+                            ids)))
+            :and (topic-links ctx etype (:and where-cond))
+            :or (let [links (map #(topic-links ctx etype [%]) (:or where-cond))]
+                  (when (every? some? links)
+                    (apply set/union links)))))
+        where-conds))
+
 (defn guarded-where-query [ctx {:keys [etype level] :as form}]
   (try
     (where-query ctx form)
@@ -1179,6 +1208,9 @@
         page-info (when-not missing-attr?
                     (page-info-of-form ctx form))
 
+        links (when-not missing-attr?
+                (topic-links ctx etype (get-in form [:option-map :where-conds])))
+
         ;; Create an eid placeholder for the sym so that `guarded-where-query`
         ;; will use good indexes, then we'll replace it in the patterns later
         sym-placeholder (or (get-in ctx [:sym-placeholders sym])
@@ -1225,6 +1257,8 @@
         {:missing-attr? missing-attr?})
       (when page-info
         {:page-info page-info})
+      (when links
+        {:topic-scope {:sym sym :links links}})
       (when aggregate
         {:aggregate aggregate
          :children nil}))}))

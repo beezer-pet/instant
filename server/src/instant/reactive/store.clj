@@ -126,6 +126,8 @@
 
    :datalog-query/delayed-call {} ;; delay with datalog result (from query.clj)
    :datalog-query/topics {:db/type :db.type/list-of-topics}
+   ;; Set of the links, each [attr-id value], that the topics are scoped to
+   :datalog-query/topic-links {}
 
    :sync/id {:db/unique :db.unique/identity
              :db/type :db.type/uuid}
@@ -933,6 +935,16 @@
                           :subscription/instaql-query query-eid
                           :subscription/datalog-query datalog-query-eid}]))))]])))
 
+(defn- topic-links
+  "The links, each `[attr-id value]`, in the entity parts of the topics."
+  [topics]
+  (into #{}
+        (for [[_idx e] topics
+              :when (set? e)
+              x e
+              :when (vector? x)]
+          x)))
+
 (defn record-datalog-query-finish! [store
                                     ctx
                                     datalog-query
@@ -940,14 +952,17 @@
 
   (let [{:keys [app-id]} ctx
         conn (app-conn store app-id)
-        lookup-ref [:datalog-query/app-id+query [app-id datalog-query]]]
+        lookup-ref [:datalog-query/app-id+query [app-id datalog-query]]
+        links (topic-links topics)]
     (transact!
      "store/record-datalog-query-finish!"
      conn
      [[:db.fn/call
        (fn [db]
          (when-some [existing (d/entity db lookup-ref)]
-           [[:db/add (:db/id existing) :datalog-query/topics topics]]))]])))
+           (cond-> [[:db/add (:db/id existing) :datalog-query/topics topics]]
+             (seq links)
+             (conj [:db/add (:db/id existing) :datalog-query/topic-links links]))))]])))
 
 ;; ------------
 ;; invalidation
@@ -1449,6 +1464,10 @@
   [store app-id tx-id isn topics wal-record]
   (let [conn (app-conn store app-id)
         db @conn
+        links (into #{}
+                    (mapcat :v)
+                    (d/datoms db :aevt :datalog-query/topic-links))
+        linked-topics (topics/with-links app-id topics links)
         datalog-query-eids
         (vec (filter-queries app-id
                              db
@@ -1456,13 +1475,13 @@
                              wal-record
                              (cond
                                (flags/use-get-datalog-queries-for-topics-v3?)
-                               (get-datalog-queries-for-topics-v3 db app-id topics)
+                               (get-datalog-queries-for-topics-v3 db app-id linked-topics)
 
                                (flags/use-get-datalog-queries-for-topics-v2?)
-                               (get-datalog-queries-for-topics-v2 db app-id topics)
+                               (get-datalog-queries-for-topics-v2 db app-id linked-topics)
 
                                :else
-                               (vec (get-datalog-queries-for-topics db app-id topics)))))
+                               (vec (get-datalog-queries-for-topics db app-id linked-topics)))))
 
         report
         (mark-datalog-queries-stale! conn app-id tx-id isn datalog-query-eids)
