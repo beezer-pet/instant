@@ -572,7 +572,7 @@ By default, Storage permissions are disabled. This means that until you explicit
 
 In your permissions rules, you can use `auth` to access the currently authenticated user, and `data` to access the file metadata.
 
-At the moment, the only available file metadata is `data.path`, which represents the file's path in Storage. Here are some example permissions:
+`data.path` is the file's path in Storage. A _create_ rule also has `data.size`, the upload's size in bytes, and `data['content-type']`, both as the upload declares them. Each is `null` when the upload does not declare it. Here are some example permissions:
 
 Allow anyone to upload and retrieve files (easy to play with but not recommended for production):
 
@@ -612,6 +612,19 @@ Authenticated users may only upload, view, and update files from their own subdi
       "create": "isOwner"
     },
     "bind": ["isOwner", "data.path.startsWith(auth.id + '/')"]
+  }
+}
+```
+
+Allow anyone to view files, and to upload PNG or JPEG images of at most 5 MB:
+
+```json
+{
+  "$files": {
+    "allow": {
+      "view": "true",
+      "create": "data.size <= 5242880 && data['content-type'] in ['image/png', 'image/jpeg']"
+    }
   }
 }
 ```

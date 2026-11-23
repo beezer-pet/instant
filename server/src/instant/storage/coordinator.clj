@@ -18,6 +18,8 @@
 
 (defn assert-storage-permission! [action {:keys [app-id
                                                  path
+                                                 size
+                                                 content-type
                                                  rules-override]
                                           :as ctx}]
   (let [rules (if rules-override
@@ -35,18 +37,24 @@
                          :attrs
                          (attr-model/get-by-app-id app-id)
                          :datalog-query-fn d/query)]
-         (cel/eval-program! ctx* program {:data {"path" path}}))))))
+         (cel/eval-program! ctx* program {:data (cond-> {"path" path}
+                                                  size (assoc "size" size)
+                                                  content-type (assoc "content-type" content-type))}))))))
 
 ;; TODO(dww): open up create/update capability for the client sdks,
 ;;            but need to clean up if the create fails
 (defn upload-file!
   "Uploads a file to S3 and tracks it in Instant. Returns a file id"
-  [{:keys [app-id path current-user mode skip-perms-check?] :as ctx}
+  [{:keys [app-id path current-user mode skip-perms-check? content-type content-length] :as ctx}
    file]
   (storage-beta/assert-storage-enabled! app-id)
   (when (not skip-perms-check?)
     (assert-storage-permission! "create" {:app-id app-id
                                           :path path
+                                          ;; A request without a Content-Length has a length of -1
+                                          :size (when (nat-int? content-length)
+                                                  content-length)
+                                          :content-type content-type
                                           :current-user current-user}))
   (let [location-id (str (random-uuid))
         _ (instant-s3/upload-file-to-s3 (assoc ctx :location-id location-id) file)

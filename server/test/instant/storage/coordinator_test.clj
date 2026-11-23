@@ -4,7 +4,10 @@
             [instant.fixtures :refer [with-empty-app]]
             [instant.model.app-user :as app-user-model]
             [instant.model.rule :as rule-model]
-            [instant.util.test :as test-util :refer [perm-err? make-attrs insert-entities suid]]))
+            [instant.util.exception :as ex]
+            [instant.util.test :as test-util :refer [perm-err? instant-ex-data make-attrs insert-entities suid]])
+  (:import
+   (java.io ByteArrayInputStream)))
 
 (deftest storage-permission-can-traverse-refs
   (with-empty-app
@@ -98,6 +101,52 @@
                 {:app-id app-id
                  :path (str "profiles/" "random" "/some-file.txt")
                  :current-user user}))))))))
+
+(deftest create-rule-sees-the-uploads-size-and-content-type
+  (with-empty-app
+    (fn [{app-id :id}]
+      (rule-model/put!
+       {:app-id app-id
+        :code {"$files" {"allow" {"create" "data.size <= 5 && data['content-type'] in ['image/png', 'application/pdf']"}}}})
+      (let [uploads (atom [])
+            upload! (fn [ctx]
+                      (coordinator/upload-file!
+                       (merge {:app-id app-id
+                               :path "photo.png"
+                               :content-type "image/png"
+                               :content-length 5}
+                              ctx)
+                       (ByteArrayInputStream. (byte-array 5))))
+            refused? (fn [ex-data]
+                       (contains? #{::ex/permission-denied
+                                    ::ex/permission-evaluation-failed}
+                                  (::ex/type ex-data)))]
+        (test-util/with-s3-mock {:upload (fn [_bucket ctx _file]
+                                           (swap! uploads conj (:content-length ctx)))
+                                 :get-object-metadata (fn [_bucket _key]
+                                                        {:size 5 :content-type "image/png"})}
+          (testing "an upload within the rule's limits is stored, with the length that the rule saw"
+            (is (uuid? (:id (upload! {}))))
+            (is (= [5] @uploads)))
+
+          (testing "a larger upload is refused before its body is read"
+            (is (refused? (instant-ex-data (upload! {:content-length 6}))))
+            (is (= [5] @uploads)))
+
+          (testing "another content type is refused"
+            (is (refused? (instant-ex-data (upload! {:content-type "text/html"}))))
+            (is (= [5] @uploads)))
+
+          (testing "an upload that declares no length has no size for the rule"
+            (is (refused? (instant-ex-data (upload! {:content-length nil}))))
+            (is (refused? (instant-ex-data (upload! {:content-length -1}))))
+            (is (= [5] @uploads)))
+
+          (testing "an upload url has no size for the rule"
+            (is (refused?
+                 (instant-ex-data
+                   (coordinator/create-upload-url! {:app-id app-id
+                                                    :path "photo.png"}))))))))))
 
 (comment
   (test/run-tests *ns*))
