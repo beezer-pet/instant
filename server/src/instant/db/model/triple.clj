@@ -273,7 +273,48 @@
      :text]
     :uuid]])
 
-(defn deep-merge-multi! [conn attrs app-id triples]
+(defn- av-sql
+  "The `av` of a triple to write, the row `t` of the rows `ts`, of the attr
+   joined as `a`. With `as-if-free?` it is false where a stored triple of
+   another entity holds the value, or `ts` gives the value to another entity,
+   which keeps the triple out of the index that would refuse it."
+  [{:keys [as-if-free?]} t ts]
+  (if-not as-if-free?
+    [:case :a.is-unique true :else false]
+    (let [col   #(keyword (str (name t) "." %))
+          value [:cast (col "value") :jsonb]
+          eid   [:cast (col "entity-id") :uuid]]
+      [:case [:and
+              :a.is-unique
+              [:not [:exists {:select :1
+                              :from [[:triples :held]]
+                              :where [:and
+                                      :held.av
+                                      [:= :held.app-id [:cast (col "app-id") :uuid]]
+                                      [:= :held.attr-id :a.id]
+                                      [:= [:json_null_to_null :held.value] [:json_null_to_null value]]
+                                      [:not= :held.entity-id eid]]}]]
+              [:not [:exists {:select :1
+                              :from [[ts :given]]
+                              :where [:and
+                                      [:= [:cast :given.attr-id :uuid] :a.id]
+                                      [:= [:json_null_to_null [:cast :given.value :jsonb]] [:json_null_to_null value]]
+                                      [:not= [:cast :given.entity-id :uuid] eid]]}]]]
+       true
+       :else false])))
+
+(defn- ea-conflict-fields
+  "What a write sets on the triple that holds the entity's value of the
+   attribute. With `as-if-free?` that is its `av` too, as `av-sql` gives it."
+  [{:keys [overwrite-t as-if-free?]}]
+  (merge {:value :excluded.value
+          :value-md5 :excluded.value-md5}
+         (when overwrite-t
+           {:created_at [:current_unix_timestamp_ms]})
+         (when as-if-free?
+           {:av :excluded.av})))
+
+(defn deep-merge-multi! [conn attrs app-id triples opts]
   (let [input-triples-values
         (->> triples
              (group-by (juxt first second))
@@ -383,7 +424,7 @@
             [:raise_exception_message "merge operation is not supported for links"]
             :else false]
            :eav]
-          [[:case :a.is-unique true :else false] :av]
+          [(av-sql opts :at :applied-triples) :av]
           [[:case :a.is-indexed true :else false] :ave]
           [[:case [:= :a.value-type [:inline "ref"]] true :else false]
            :vae]
@@ -402,8 +443,7 @@
                         :from :enhanced-triples
                         :order-by [:app-id :entity-id :attr-id :value-md5]}]
          :on-conflict [:app-id :entity-id :attr-id {:where [:= :ea true]}]
-         :do-update-set {:value :excluded.value
-                         :value-md5 :excluded.value-md5}
+         :do-update-set (ea-conflict-fields opts)
          :returning [:entity-id :attr-id]}
 
         q {:with (concat
@@ -427,12 +467,6 @@
 
 (def value-lookup-error-prefix "missing-lookup-value")
 
-(defn- ea-conflict-fields [overwrite-t]
-  (merge {:value :excluded.value
-          :value-md5 :excluded.value-md5}
-         (when overwrite-t
-           {:created_at [:current_unix_timestamp_ms]})))
-
 (defn- id-attr-conflict? []
   [:exists {:select :1
             :from [[:attrs :id-attr]]
@@ -443,11 +477,8 @@
                      [:= :id-attr.app-id system-catalog-app-id]]
                     [:= :id-attr.label "id"]]}])
 
-(defn- ea-conflict-update-set [overwrite-t]
-  (let [fields (merge {:value :excluded.value
-                       :value-md5 :excluded.value-md5}
-                      (when overwrite-t
-                        {:created_at [:current_unix_timestamp_ms]}))]
+(defn- ea-conflict-update-set [{:keys [overwrite-t] :as opts}]
+  (let [fields (ea-conflict-fields opts)]
     (if overwrite-t
       fields
       {:fields fields
@@ -487,7 +518,7 @@
    path is proven out."
   ([conn attrs app-id triples]
    (insert-multi-old! conn attrs app-id triples {:overwrite-t false}))
-  ([conn attrs app-id triples {:keys [overwrite-t] :as opts}]
+  ([conn attrs app-id triples opts]
    (let [scoped-plan (scoped-write-plans/null-padding-shape attrs app-id triples opts)
          lookup-refs
          (distinct
@@ -631,7 +662,7 @@
            [[:md5 :it.value] :value-md5]
            [[:case [:= :a.cardinality [:inline "one"]] true :else false] :ea]
            [[:case [:= :a.value-type [:inline "ref"]] true :else false] :eav]
-           [[:case :a.is-unique true :else false] :av]
+           [(av-sql opts :it :input-triples) :av]
            [[:case :a.is-indexed true :else false] :ave]
            [[:case [:= :a.value-type [:inline "ref"]] true :else false] :vae]
            [:a.checked_data_type :checked-data-type]]
@@ -658,7 +689,7 @@
                          :from :ea-triples-distinct
                          :order-by [:app-id :entity-id :attr-id :value-md5]}]
           :on-conflict [:app-id :entity-id :attr-id {:where [:= :ea true]}]
-          :do-update-set (ea-conflict-update-set overwrite-t)
+          :do-update-set (ea-conflict-update-set opts)
           :returning :*}
 
          remaining-inserts
@@ -960,7 +991,7 @@
           [[:md5 :it.value] :value-md5]
           [[:case [:= :a.cardinality [:inline "one"]] true :else false] :ea]
           [[:case [:= :a.value-type [:inline "ref"]] true :else false] :eav]
-          [[:case :a.is-unique true :else false] :av]
+          [(av-sql opts :it :input-triples) :av]
           [[:case :a.is-indexed true :else false] :ave]
           [[:case [:= :a.value-type [:inline "ref"]] true :else false] :vae]
           [:a.checked_data_type :checked-data-type]
@@ -992,7 +1023,7 @@
                         :order-by [:app-id :entity-id :attr-id :value-md5]}]
          :on-conflict [:app-id :entity-id :attr-id {:where [:= :ea true]}]
           ;; Skip no-op updates: only write when the value actually changed.
-         :do-update-set (let [fields (ea-conflict-fields overwrite-t)]
+         :do-update-set (let [fields (ea-conflict-fields opts)]
                           (if overwrite-t
                             fields
                             {:fields fields
@@ -1039,7 +1070,7 @@
                         :where :is-id-attr
                         :order-by [:app-id :entity-id :attr-id :value-md5]}]
          :on-conflict [:app-id :entity-id :attr-id {:where [:= :ea true]}]
-         :do-update-set (let [fields (ea-conflict-fields overwrite-t)]
+         :do-update-set (let [fields (ea-conflict-fields opts)]
                           (if overwrite-t
                             fields
                             {:fields fields
@@ -1223,7 +1254,10 @@
    not trigger a conflict, but trying to insert [1 user/pet 2] will no-op.
 
    If overwrite-t is set to true (defaults to false), the created_at will
-   update on the triple when the value changes."
+   update on the triple when the value changes.
+
+   With as-if-free?, for a transaction that is rolled back, a value of a
+   unique attribute that another entity holds or is given is not refused."
   ([conn attrs app-id triples]
    (insert-multi! conn attrs app-id triples {:overwrite-t false}))
   ([conn attrs app-id triples opts]

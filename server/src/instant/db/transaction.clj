@@ -561,7 +561,14 @@
   [attrs attr-id]
   (attr-model/seek-by-id attr-id attrs))
 
-(defn transact-without-tx-conn-impl! [conn attrs app-id tx-step-maps opts]
+(defn transact-without-tx-conn-impl!
+  "Applies the steps on `conn`, in the transaction that the caller has opened.
+
+   With `:as-if-free?`, for a transaction that is rolled back, a value of a
+   unique attribute that another entity holds or is given is not refused. With
+   `:no-transaction-id?`, for such a transaction too, no transaction id is
+   taken: a rollback does not give an id back."
+  [conn attrs app-id tx-step-maps opts]
   (binding [ex/*get-attr-for-exception* (partial get-attr-for-exception attrs)]
     (let [tx-step-vecs     (map vectorize-tx-step tx-step-maps)
           grouped-tx-steps (group-by first tx-step-vecs)]
@@ -575,7 +582,8 @@
         (validate-mode conn app-id tx-step-maps)
         ;; n.b. transaction-model/create! must be the first write to the db
         ;;      or else the invalidator will miss the transaction.
-        (let [tx (transaction-model/create! conn {:app-id app-id})
+        (let [tx (when-not (:no-transaction-id? opts)
+                   (transaction-model/create! conn {:app-id app-id}))
               results
               (reduce-kv
                (fn [acc op tx-steps]
@@ -607,11 +615,18 @@
                             :add-triple
                             (triple-model/insert-multi!
                              conn attrs app-id (map next tx-steps)
-                             (when (not= #{:add-triple} (set (keys grouped-tx-steps)))
-                               {:disable-scoped-write-plan? true}))
+                             ;; nil for a plain write, which is how
+                             ;; scoped-write-plans tells one
+                             (cond-> nil
+                               (not= #{:add-triple} (set (keys grouped-tx-steps)))
+                               (assoc :disable-scoped-write-plan? true)
+
+                               (:as-if-free? opts)
+                               (assoc :as-if-free? true)))
 
                             :deep-merge-triple
-                            (triple-model/deep-merge-multi! conn attrs app-id (map next tx-steps))
+                            (triple-model/deep-merge-multi! conn attrs app-id (map next tx-steps)
+                                                            (select-keys opts [:as-if-free?]))
 
                             :retract-triple
                             (triple-model/delete-multi! conn attrs app-id (map next tx-steps))))))
@@ -628,12 +643,13 @@
                                  (filter #(= :update-attr (:op %)))
                                  (map :value))
               _  (attr-model/validate-update-required! conn app-id updated-attrs)]
-          (let [tx-created-at (Date/.toInstant (:created_at tx))]
-            (e2e-tracer/start-invalidator-tracking! {:tx-id (:id tx)
-                                                     :tx-created-at tx-created-at})
-            (e2e-tracer/invalidator-tracking-step! {:tx-id (:id tx)
-                                                    :tx-created-at tx-created-at
-                                                    :name "transact"}))
+          (when tx
+            (let [tx-created-at (Date/.toInstant (:created_at tx))]
+              (e2e-tracer/start-invalidator-tracking! {:tx-id (:id tx)
+                                                       :tx-created-at tx-created-at})
+              (e2e-tracer/invalidator-tracking-step! {:tx-id (:id tx)
+                                                      :tx-created-at tx-created-at
+                                                      :name "transact"})))
           (assoc tx :results results))))))
 
 (defn- tx-step-op [tx-step]

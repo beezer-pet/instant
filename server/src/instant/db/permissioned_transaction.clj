@@ -901,12 +901,18 @@
 
    We run `create` checks _after_ the transaction, so we can query off of the
    object. For example, if we created a new `post`, we may want a check that says:
-   `auth.id in data.ref('creator.id')`"
-  [{:keys [db app-id admin? admin-check? admin-dry-run? attrs] :as ctx} tx-step-vecs]
+   `auth.id in data.ref('creator.id')`
+
+   With `::as-if-free?`, step 5 refuses no value of a unique attribute that
+   another entity holds or is given, and nothing is stored. A session's
+   transaction then takes no transaction id, since a client can count the
+   ids."
+  [{:keys [db app-id admin? admin-check? admin-dry-run? attrs ::as-if-free?] :as ctx} tx-step-vecs]
   (tracer/with-span! {:name "permissioned-transaction/transact!"
                       :attributes {:app-id app-id
                                    :transact-version "2"}}
-    (when (flags/rate-limit-tx-based-on-conn-pool?)
+    (when (and (flags/rate-limit-tx-based-on-conn-pool?)
+               (not as-if-free?))
       (let [^HikariDataSource pool (:conn-pool db)]
         (when (instance? HikariDataSource pool)
           (let [mx-bean (.getHikariPoolMXBean pool)
@@ -977,7 +983,10 @@
                   ;; transact to DB
                   tx-step-maps         ordered-tx-step-maps
                   tx-data              (io/expect-io
-                                        (tx/transact-without-tx-conn-impl! tx-conn (:attrs ctx) app-id tx-step-maps {}))
+                                        (tx/transact-without-tx-conn-impl! tx-conn (:attrs ctx) app-id tx-step-maps
+                                                                           {:as-if-free?        as-if-free?
+                                                                            :no-transaction-id? (and as-if-free?
+                                                                                                     (not admin-check?))}))
                   _                    (validate-retracted! ctx entities-map cleared tx-step-maps tx-data)
 
                   ;; post checks
@@ -1004,9 +1013,10 @@
                   ;; finalizing
                   check-results        (concat pre-check-results post-check-results)
                   all-checks-ok?       (every? :check-result check-results)
-                  rollback?            (and admin-check?
-                                            (or admin-dry-run?
-                                                (not all-checks-ok?)))]
+                  rollback?            (or as-if-free?
+                                           (and admin-check?
+                                                (or admin-dry-run?
+                                                    (not all-checks-ok?))))]
               (when rollback?
                 (io/expect-io
                  (.rollback tx-conn)))
@@ -1021,17 +1031,39 @@
   (= :deadlock-detected
      (some-> (ex/find-instant-exception e) ex-data ::ex/hint :condition)))
 
+(defn- value-taken? [e]
+  (let [data (some-> (ex/find-instant-exception e) ex-data)]
+    (and (= ::ex/record-not-unique (::ex/type data))
+         (= :triple (:record-type (::ex/hint data))))))
+
 (defn transact!
   "Runs `transact-once!`, and runs it again if Postgres aborts it to break a
-   deadlock. Nothing of an aborted transaction is stored."
+   deadlock. Nothing of an aborted transaction is stored.
+
+   The database refuses a value of a unique attribute that another entity
+   holds or is given when it is written, which is before the create rules
+   are asked. A transaction refused so is run again with `::as-if-free?`,
+   and answered as that run is where that run is refused or fails; otherwise
+   as not unique."
   [ctx tx-step-vecs]
   (loop [retries 0]
     (let [res (try
                 (transact-once! ctx tx-step-vecs)
                 (catch Exception e
-                  (if (and (< retries max-deadlock-retries)
-                           (deadlock? e))
+                  (cond
+                    (and (< retries max-deadlock-retries)
+                         (deadlock? e))
                     ::deadlock
+
+                    (and (value-taken? e)
+                         (not (:admin? ctx))
+                         (not (::as-if-free? ctx)))
+                    (let [res (transact! (assoc ctx ::as-if-free? true) tx-step-vecs)]
+                      (if (:all-checks-ok? res)
+                        (throw e)
+                        res))
+
+                    :else
                     (throw e))))]
       (if (= ::deadlock res)
         (recur (inc retries))

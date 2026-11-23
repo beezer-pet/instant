@@ -10,6 +10,7 @@
    [instant.db.datalog :as d]
    [instant.db.instaql :as iq]
    [instant.db.model.attr :as attr-model]
+   [instant.db.model.transaction :as transaction-model]
    [instant.db.model.triple :as triple-model]
    [instant.model.app-file :as app-file-model]
    [instant.db.permissioned-transaction :as permissioned-tx]
@@ -5758,6 +5759,191 @@
               (make-ctx)
               [[:add-triple todo-id attr-todos-id   todo-id]
                [:add-triple todo-id attr-todos-text [#uuid "2473c57f-6a58-4167-96b7-cf9e034a670a" #uuid "7758b4b1-7c0b-4c90-9532-f41a54812f76"]]])))))))
+
+(deftest held-unique-value-is-told-after-the-rules
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id  (test-util/make-attrs
+                       app-id
+                       [[:item/id :unique? :index?]
+                        [:item/key :unique? :index?]
+                        [:owner/id :unique? :index?]
+                        [:owner/name]
+                        [[:item/owner :owner/items]]
+                        [:slot/id :unique? :index?]
+                        [[:item/slot :slot/item] :unique?]
+                        [:doc/id :unique? :index?]
+                        [:doc/key :unique?]
+                        [:doc/title :required?]])
+            item-id   (attr->id :item/id)
+            item-key  (attr->id :item/key)
+            item-slot (attr->id :item/slot)
+            owner     (random-uuid)
+            slot      (random-uuid)
+            free-slot (random-uuid)
+            held      (random-uuid)
+            other     (random-uuid)
+            held-doc  (random-uuid)
+            make-ctx  (fn [opts]
+                        (merge {:db               {:conn-pool (aurora/conn-pool :write)}
+                                :app-id           app-id
+                                :attrs            (attr-model/get-by-app-id app-id)
+                                :datalog-query-fn d/query
+                                :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                                :current-user     nil}
+                               opts))
+            put-rules! (fn [rules]
+                         (rule-model/put! (aurora/conn-pool :write)
+                                          {:app-id app-id
+                                           :code   {:$default {:allow rules}}}))
+            transact! (fn transact!
+                        ([tx-steps]
+                         (transact! {} tx-steps))
+                        ([opts tx-steps]
+                         (permissioned-tx/transact! (make-ctx opts) tx-steps)))
+            answer    (fn [& args]
+                        (select-keys (test-util/instant-ex-data (apply transact! args))
+                                     [::ex/type ::ex/message ::ex/hint]))
+            checks    (fn [opts tx-steps]
+                        (let [res (transact! (merge {:admin-check? true :admin-dry-run? true} opts)
+                                             tx-steps)]
+                          [(:all-checks-ok? res)
+                           (:committed? res)
+                           (some? (:id res))
+                           (map (juxt :action :etype :check-pass?) (:check-results res))]))
+            item      (fn [id key]
+                        [[:add-triple id item-id id]
+                         [:add-triple id item-key key]])
+            merged    (fn [id key]
+                        [[:add-triple id item-id id]
+                         [:deep-merge-triple id item-key key]])
+            owned     (fn [id key]
+                        (conj (item id key) [:add-triple id (attr->id :item/owner) owner]))
+            in-slot   (fn [id slot]
+                        [[:add-triple id item-id id]
+                         [:add-triple id item-slot slot]])
+            doc       (fn [id key]
+                        [[:add-triple id (attr->id :doc/id) id]
+                         [:add-triple id (attr->id :doc/key) key]])
+            not-unique {::ex/type    ::ex/record-not-unique
+                        ::ex/message "`key` is a unique attribute on `item` and an entity already exists with `item.key` = \"k\""
+                        ::ex/hint    {:record-type :triple
+                                      :attr-id     item-key
+                                      :etype       "item"
+                                      :label       "key"
+                                      :value       "\"k\""}}
+            stored    (fn []
+                        (fetch-triples app-id [[:in :entity-id [held other slot free-slot held-doc]]]))
+            _         (test-util/insert-entities
+                       app-id attr->id
+                       [{:db/id owner :owner/id owner :owner/name "o"}
+                        {:db/id slot :slot/id slot}
+                        {:db/id free-slot :slot/id free-slot}
+                        {:db/id held :item/id held :item/key "k" :item/slot slot}
+                        {:db/id other :item/id other :item/key "y"}
+                        {:db/id held-doc :doc/id held-doc :doc/key "k" :doc/title "t"}])
+            before    (stored)
+            id        (random-uuid)]
+        (testing "a create that the rule refuses is answered as refused"
+          (put-rules! {:create "false"})
+          (is (= ::ex/permission-denied (::ex/type (answer (item id "k")))))
+          (is (= (answer (item id "free"))
+                 (answer (item id "k"))))
+          (testing "with a value that is merged"
+            (is (= (answer (merged id "free"))
+                   (answer (merged id "k")))))
+          (testing "with a link that is unique"
+            (is (= (answer (in-slot id free-slot))
+                   (answer (in-slot id slot))
+                   (answer (in-slot id [(attr->id :slot/id) slot])))))
+          (testing "with the id of another entity as its id"
+            (is (= (answer [[:add-triple id item-id (random-uuid)]])
+                   (answer [[:add-triple id item-id held]]))))
+          (testing "with several values that are held"
+            (is (= (answer (concat (item id "free") (item (random-uuid) "free too")))
+                   (answer (concat (item id "k") (item (random-uuid) "y"))))))
+          (testing "with a lookup of a value that the transaction writes"
+            (let [id2       (random-uuid)
+                  looked-up (fn [key]
+                              [[:deep-merge-triple id item-key key]
+                               [:deep-merge-triple id2 item-key "new"]
+                               [:add-triple id item-id id]
+                               [:add-triple id2 item-id id2]
+                               [:add-triple [item-key "new"] (attr->id :item/owner) owner]])]
+              (is (= ::ex/validation-failed (::ex/type (answer (looked-up "k")))))
+              (is (= (answer (looked-up "free"))
+                     (answer (looked-up "k"))))))
+          (testing "with one value for two entities"
+            (let [id2 (random-uuid)]
+              (is (= (answer (concat (item id "free") (item id2 "free too")))
+                     (answer (concat (item id "new") (item id2 "new")))
+                     (answer (concat (item id "k") (item id2 "k")))))
+              (is (= (answer (concat (merged id "new") (merged id2 "new")))
+                     (answer (concat (merged id "k") (merged id2 "k")))))
+              (is (= (answer (concat (in-slot id free-slot) (in-slot id2 free-slot)))
+                     (answer (concat (in-slot id slot) (in-slot id2 slot))))))))
+        (testing "a create that the rule allows is answered as not unique"
+          (put-rules! {:create "true" :update "true"})
+          (is (= not-unique
+                 (answer (item id "k"))
+                 (answer (merged id "k"))))
+          (is (= ::ex/record-not-unique
+                 (::ex/type (answer (in-slot id slot)))
+                 (::ex/type (answer (concat (item id "new") (item (random-uuid) "new"))))
+                 (::ex/type (answer (concat (item id "k") (item (random-uuid) "k"))))))
+          (testing "also where the transaction retracts the value from its holder afterwards"
+            (is (= not-unique (answer (conj (item id "k") [:retract-triple held item-key "k"]))))))
+        (testing "the rule is asked with what the transaction writes"
+          (put-rules! {:create "'o' in data.ref('owner.name')"})
+          (is (= not-unique (answer (owned id "k"))))
+          (is (= ::ex/permission-denied (::ex/type (answer (item id "k")))))
+          (is (= (answer (item id "free"))
+                 (answer (item id "k")))))
+        (testing "an update that the rule refuses is answered as refused"
+          (put-rules! {:update "false"})
+          (is (= ::ex/permission-denied (::ex/type (answer [[:add-triple other item-key "k"]]))))
+          (is (= (answer [[:add-triple other item-key "free"]])
+                 (answer [[:add-triple other item-key "k"]])))
+          (put-rules! {:update "true"})
+          (is (= not-unique (answer [[:add-triple other item-key "k"]]))))
+        (testing "a write that is not valid is answered as with a value that is free"
+          (put-rules! {:create "false"})
+          (is (= ::ex/validation-failed (::ex/type (answer (doc id "k")))))
+          (is (= (answer (doc id "free"))
+                 (answer (doc id "k")))))
+        (testing "a held value takes no more transaction ids than a free one"
+          (put-rules! {:create "false"})
+          (let [create! transaction-model/create!
+                taken   (fn [tx-steps]
+                          (let [ids (atom 0)]
+                            (with-redefs [transaction-model/create! (fn [& args]
+                                                                      (swap! ids inc)
+                                                                      (apply create! args))]
+                              (answer tx-steps))
+                            @ids))]
+            (is (= 1
+                   (taken (item id "free"))
+                   (taken (item id "k"))))))
+        (testing "the checks of a debug transaction are the ones of a value that is free"
+          (put-rules! {:create "false" :update "false"})
+          (is (= [false false true [[:create "item" false]]]
+                 (checks {} (item id "k"))))
+          (is (= (checks {} (item id "free"))
+                 (checks {} (item id "k"))))
+          (is (= (checks {:admin-dry-run? false} (item id "free"))
+                 (checks {:admin-dry-run? false} (item id "k"))))
+          (is (= (checks {} [[:add-triple other item-key "free"]])
+                 (checks {} [[:add-triple other item-key "k"]])))
+          (put-rules! {:create "true" :update "true"})
+          (is (= not-unique
+                 (answer {:admin-check? true :admin-dry-run? true} (item id "k"))
+                 (answer {:admin-check? true} [[:add-triple other item-key "k"]]))))
+        (testing "an admin is answered as not unique"
+          (put-rules! {:create "false"})
+          (is (= not-unique (answer {:admin? true} (item id "k")))))
+        (testing "nothing is stored"
+          (is (= before (stored)))
+          (is (= #{} (fetch-triples app-id [[:= :entity-id id]]))))))))
 
 (deftest retract-triple-checks
   (with-empty-app
