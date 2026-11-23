@@ -1,5 +1,6 @@
 (ns instant.util.string
   (:import
+   (java.security SecureRandom)
    (java.util.zip CRC32))
   (:require
    [clojure.string :as string]))
@@ -11,10 +12,12 @@
     String x
     (str x)))
 
+(def ^:private ^SecureRandom secure-random (SecureRandom.))
+
 (defn rand-num-str
-  "Generates a random string composed of size len with all numbers"
+  "Generates a random string of len digits, each drawn from a SecureRandom"
   [len]
-  (apply str (take len (repeatedly #(rand-nth (range 0 9))))))
+  (apply str (repeatedly len #(.nextInt secure-random 10))))
 
 (defn unique-int
   "Converts a string/kw name/symbol to a unique int"
