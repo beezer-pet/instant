@@ -59,26 +59,28 @@
                :code code))))))
 
 (defn consume!
+  "Deletes and returns the code, if it is a code of the email. A code that has
+   expired is deleted and refused as a code that does not exist."
   ([params]
    (consume! (aurora/conn-pool :write) params))
   ([conn {:keys [email code app-id] :as params}]
-   (update-op
-    conn
-    {:app-id app-id
-     :etype etype}
-    (fn [{:keys [get-entity-where delete-entity!]}]
-      (let [code-hash (-> code
-                          crypt-util/str->sha256
-                          crypt-util/bytes->hex-string)
-            {code-id :id} (get-entity-where
-                           {:codeHash code-hash
-                            :email    email})]
-        (ex/assert-record! code-id :app-user-magic-code {:args [params]})
-        (let [code (delete-entity! code-id)]
-          (ex/assert-record! code :app-user-magic-code {:args [params]})
-          (when (expired? app-id code)
-            (ex/throw-expiration-err! :app-user-magic-code {:args [params]}))
-          code))))))
+   (let [magic-code (update-op
+                     conn
+                     {:app-id app-id
+                      :etype etype}
+                     (fn [{:keys [get-entity-where delete-entity!]}]
+                       (let [code-hash (-> code
+                                           crypt-util/str->sha256
+                                           crypt-util/bytes->hex-string)
+                             {code-id :id} (get-entity-where
+                                            {:codeHash code-hash
+                                             :email    email})]
+                         (when code-id
+                           (delete-entity! code-id)))))]
+     (ex/assert-record! (when-not (expired? app-id magic-code)
+                          magic-code)
+                        :app-user-magic-code
+                        {:args [params]}))))
 
 (comment
   (def instant-user (instant-user-model/get-by-email

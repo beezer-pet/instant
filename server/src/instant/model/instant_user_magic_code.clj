@@ -43,6 +43,8 @@
    (> (.between ChronoUnit/MINUTES (Date/.toInstant created-at) now) 10)))
 
 (defn consume!
+  "Deletes and returns the code, if it is a code of the email. A code that has
+   expired is deleted and refused as a code that does not exist."
   ([params] (consume! (aurora/conn-pool :write) params))
   ([conn {:keys [email code] :as params}]
    (let [m (sql/execute-one! conn
@@ -54,10 +56,10 @@
                                  instant_users.email = ?
                                RETURNING instant_user_magic_codes.*"
                               code email])]
-     (ex/assert-record! m :instant-user-magic-code {:args [params]})
-     (when (expired? m)
-       (ex/throw-expiration-err! :instant-user-magic-code {:args [params]}))
-     m)))
+     (ex/assert-record! (when (and m (not (expired? m)))
+                          m)
+                        :instant-user-magic-code
+                        {:args [params]}))))
 
 (comment
   (def u (instant-user-model/get-by-email {:email "stopa@instantdb.com"}))

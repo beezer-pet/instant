@@ -2,6 +2,8 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [instant.fixtures :refer [with-user]]
+   [instant.jdbc.aurora :as aurora]
+   [instant.jdbc.sql :as sql]
    [instant.model.instant-user-magic-code :as magic-code]
    [instant.util.exception :as ex])
   (:import
@@ -19,6 +21,13 @@
       (when-not (= ::ex/record-not-found (::ex/type (ex-data e)))
         (throw e))
       false)))
+
+(defn- refusal [params]
+  (try
+    (magic-code/consume! params)
+    nil
+    (catch ExceptionInfo e
+      (select-keys (ex-data e) [::ex/type ::ex/message]))))
 
 (deftest a-new-code-replaces-the-users-earlier-codes
   (with-user
@@ -42,3 +51,18 @@
                        doall
                        (mapv deref))]
         (is (= 1 (count (filter consumes? codes))))))))
+
+(deftest an-expired-code-is-refused-as-a-wrong-code-is
+  (with-user
+    (fn [{user-id :id :as user}]
+      (let [params (create! user "111111")]
+        (sql/execute! (aurora/conn-pool :write)
+                      ["UPDATE instant_user_magic_codes SET created_at = created_at - interval '1 hour' WHERE user_id = ?::uuid"
+                       user-id])
+        (is (= ::ex/record-not-found (::ex/type (refusal (assoc params :code "wrong")))))
+        (is (= (refusal (assoc params :code "wrong"))
+               (refusal params)))
+        (testing "and is deleted"
+          (is (empty? (sql/select (aurora/conn-pool :read)
+                                  ["SELECT 1 FROM instant_user_magic_codes WHERE user_id = ?::uuid"
+                                   user-id]))))))))

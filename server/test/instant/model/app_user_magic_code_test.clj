@@ -2,6 +2,8 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [instant.fixtures :refer [with-empty-app]]
+   [instant.jdbc.aurora :as aurora]
+   [instant.jdbc.sql :as sql]
    [instant.model.app-user-magic-code :as magic-code]
    [instant.util.exception :as ex])
   (:import
@@ -15,6 +17,13 @@
       (when-not (= ::ex/record-not-found (::ex/type (ex-data e)))
         (throw e))
       false)))
+
+(defn- refusal [params]
+  (try
+    (magic-code/consume! params)
+    nil
+    (catch ExceptionInfo e
+      (select-keys (ex-data e) [::ex/type ::ex/message]))))
 
 (deftest a-new-code-replaces-the-emails-earlier-codes
   (with-empty-app
@@ -45,3 +54,19 @@
                         doall
                         (mapv deref))]
         (is (= 1 (count (filter #(consumes? (assoc params :code %)) codes))))))))
+
+(deftest an-expired-code-is-refused-as-a-wrong-code-is
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [params            {:app-id app-id :email "a@b.c"}
+            {:keys [id code]} (magic-code/create! params)]
+        (sql/execute! (aurora/conn-pool :write)
+                      ["UPDATE triples SET created_at = ? WHERE app_id = ?::uuid AND entity_id = ?::uuid"
+                       (- (System/currentTimeMillis) (* 25 60 60 1000)) app-id id])
+        (is (= ::ex/record-not-found (::ex/type (refusal (assoc params :code "wrong")))))
+        (is (= (refusal (assoc params :code "wrong"))
+               (refusal (assoc params :code code))))
+        (testing "and is deleted"
+          (is (empty? (sql/select (aurora/conn-pool :read)
+                                  ["SELECT 1 FROM triples WHERE app_id = ?::uuid AND entity_id = ?::uuid"
+                                   app-id id]))))))))

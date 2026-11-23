@@ -2,6 +2,7 @@
   (:require
    [clojure.string :as string]
    [clojure.test :refer [deftest is testing]]
+   [clojure.walk :as walk]
    [instant.config :as config]
    [instant.core :as core]
    [instant.db.datalog :as d]
@@ -287,9 +288,18 @@
      [send-code-admin   verify-code-admin]]]
    (with-empty-app
      (fn [{app-id :id :as app}]
-       (let [code (send-code app {:email "a@b.c"})]
+       (let [code    (send-code app {:email "a@b.c"})
+             refusal (fn [code]
+                       (try
+                         (verify-code app {:email "a@b.c" :code code})
+                         (catch ExceptionInfo e
+                           (->> (-> (ex-data e)
+                                    (select-keys [:status :body])
+                                    (update :body dissoc :trace-id))
+                                (walk/postwalk-replace {code :code})))))]
          (update-created-at app-id code (- (System/currentTimeMillis) (* 25 60 60 1000)))
-         (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "a@b.c" :code code}))))
+         (is (= 400 (:status (refusal "wrong"))))
+         (is (= (refusal "wrong") (refusal code))))
 
        (let [code (send-code app {:email "a@b.c"})]
          (update-created-at app-id code (- (System/currentTimeMillis) (* 23 60 60 1000)))
