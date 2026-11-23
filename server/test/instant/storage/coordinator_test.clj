@@ -2,10 +2,11 @@
   (:require [clojure.test :as test :refer [deftest is testing]]
             [instant.storage.coordinator :as coordinator]
             [instant.fixtures :refer [with-empty-app]]
+            [instant.flags :as flags]
             [instant.model.app-user :as app-user-model]
             [instant.model.rule :as rule-model]
             [instant.util.exception :as ex]
-            [instant.util.test :as test-util :refer [perm-err? instant-ex-data make-attrs insert-entities suid]])
+            [instant.util.test :as test-util :refer [perm-err? validation-err? instant-ex-data make-attrs insert-entities suid]])
   (:import
    (java.io ByteArrayInputStream)))
 
@@ -147,6 +148,46 @@
                  (instant-ex-data
                    (coordinator/create-upload-url! {:app-id app-id
                                                     :path "photo.png"}))))))))))
+
+(deftest storage-max-upload-bytes-caps-every-upload
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [uploads (atom 0)
+            upload! (fn [content-length & {:as ctx}]
+                      (coordinator/upload-file!
+                       (merge {:app-id app-id
+                               :path "photo.png"
+                               :content-length content-length
+                               :skip-perms-check? true}
+                              ctx)
+                       (ByteArrayInputStream. (byte-array 5))))]
+        (test-util/with-s3-mock {:upload (fn [_bucket _ctx _file]
+                                           (swap! uploads inc))
+                                 :get-object-metadata (fn [_bucket _key]
+                                                        {:size 5})}
+          (testing "without the flag an upload of any length is stored"
+            (binding [flags/*flag-overrides* {:storage-max-upload-bytes nil}]
+              (is (uuid? (:id (upload! 6))))
+              (is (uuid? (:id (upload! -1)))))
+            (is (= 2 @uploads)))
+
+          (binding [flags/*flag-overrides* {:storage-max-upload-bytes 5}]
+            (testing "an upload of the largest size is stored"
+              (is (uuid? (:id (upload! 5))))
+              (is (= 3 @uploads)))
+
+            (testing "a larger upload is refused before its body is read"
+              (is (validation-err? (upload! 6)))
+              (is (= 3 @uploads)))
+
+            (testing "an upload that declares no length is refused"
+              (is (validation-err? (upload! -1)))
+              (is (validation-err? (upload! nil)))
+              (is (= 3 @uploads)))
+
+            (testing "a file that the server stores for a stream has no limit"
+              (is (uuid? (:id (upload! 6 :skip-size-check? true))))
+              (is (= 4 @uploads)))))))))
 
 (comment
   (test/run-tests *ns*))

@@ -41,13 +41,27 @@
                                                   size (assoc "size" size)
                                                   content-type (assoc "content-type" content-type))}))))))
 
+(defn- assert-upload-size!
+  "Refuses an upload that is larger than the storage-max-upload-bytes flag
+   allows, or that declares no length while the flag is set."
+  [content-length]
+  (when-let [limit (flags/storage-max-upload-bytes)]
+    (when-not (and (nat-int? content-length)
+                   (<= content-length limit))
+      (ex/throw-validation-err!
+       :content-length
+       content-length
+       [{:message (format "An upload must declare a Content-Length of at most %d bytes." limit)}]))))
+
 ;; TODO(dww): open up create/update capability for the client sdks,
 ;;            but need to clean up if the create fails
 (defn upload-file!
   "Uploads a file to S3 and tracks it in Instant. Returns a file id"
-  [{:keys [app-id path current-user mode skip-perms-check? content-type content-length] :as ctx}
+  [{:keys [app-id path current-user mode skip-perms-check? skip-size-check? content-type content-length] :as ctx}
    file]
   (storage-beta/assert-storage-enabled! app-id)
+  (when (not skip-size-check?)
+    (assert-upload-size! content-length))
   (when (not skip-perms-check?)
     (assert-storage-permission! "create" {:app-id app-id
                                           :path path

@@ -643,6 +643,14 @@
   []
   (flag :stream-flush-byte-limit 1048576))
 
+(defn storage-max-upload-bytes
+  "The largest upload that storage accepts, in bytes. nil for no limit.
+   The files that the server stores for a stream are no uploads."
+  []
+  (let [limit (flag :storage-max-upload-bytes)]
+    (when (pos-int? limit)
+      limit)))
+
 (defn magic-code-rate-limit-per-hour
   "Max number of magic code emails per email address per app per hour."
   []

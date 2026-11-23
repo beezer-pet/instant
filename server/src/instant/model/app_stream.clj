@@ -293,6 +293,7 @@
                                                       :content-type "application/octet-stream"
                                                       :content-length buffer-byte-size
                                                       :skip-perms-check? true
+                                                      :skip-size-check? true
                                                       :mode :create}
                                                      (ByteBufInputStream. buff true))
                    (catch clojure.lang.ExceptionInfo e

@@ -145,6 +145,12 @@ Instant supports spinning up temporary apps without authentication. Because thes
 
 To disable temporary app creation, open **Deployment Settings** and turn off **Allow temporary app creation** under **Temporary apps**.
 
+### Storage
+
+Storage reads its settings from the `flags` of the Instant Config app. Open **Deployment Settings**, then **Advanced settings**, and add a row to `flags` with the setting's name as `setting` and a number as `value`. A change applies without a restart.
+
+- `storage-max-upload-bytes`: the largest upload that Storage accepts, in bytes. An upload that is larger, or that declares no `Content-Length`, is refused. Without the setting there is no limit. The server still receives the body of an upload that it refuses, so limit the size of a request's body in your reverse proxy as well.
+
 ### Configure the Instant CLI
 
 Instant comes with CLI tools for creating and managing your Instant apps. By
