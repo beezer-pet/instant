@@ -6106,13 +6106,24 @@
                                           [:retract-triple item owner gone]
                                           [:add-triple item owner owner-b]])))
               (is (= #{owner-b} (stored item owner)))))
-          (testing "but a value that is written between the two is expected of the retract"
-            (let [item (make-item! {:item/data {"a" 0}})]
-              (put-rules! {:update "newData.data == null" :delete "true"})
-              (is (validation-err? (transact! [[:delete-entity item "item"]
-                                               [:deep-merge-triple item data {"b" 1}]
-                                               [:retract-triple item data {"a" 0 "b" 1}]])))
-              (is (= #{{"a" 0}} (stored item data))))))
+          (testing "but a value that is written between the two is there for the retract"
+            (put-rules! {:create "data.secret == null" :delete "true"})
+            (let [item (make-item!)]
+              (is (perm-err? (transact! [[:delete-entity item "item"]
+                                         [:add-triple item secret "x"]
+                                         [:retract-triple item secret "s"]])))
+              (is (= #{"s"} (stored item secret)))
+              (is (perm-pass? (transact! [[:delete-entity item "item"]
+                                          [:add-triple item secret "x"]
+                                          [:retract-triple item secret "x"]])))
+              (is (= #{} (stored item secret))))
+            (testing "and refused where the database holds it in another form"
+              (put-rules! {:create "data.data == null" :delete "true"})
+              (let [item (make-item! {:item/data {"a" 0}})]
+                (is (validation-err? (transact! [[:delete-entity item "item"]
+                                                 [:deep-merge-triple item data {"b" 1}]
+                                                 [:retract-triple item data {"b" 1}]])))
+                (is (= #{{"a" 0}} (stored item data)))))))
         (testing "a retract that doesn't do what the checks expect is refused"
           (testing "of an entity that changed after the checks read it"
             (let [item    (make-item!)
@@ -6439,6 +6450,167 @@
             (rules! {:owner {:allow {:view "true"}}})
             (is (perm-pass? (transact! [[:add-triple item owner [owner-id o]]])))
             (is (= #{o} (stored item owner)))))))))
+
+(deftest entity-deleted-and-written
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id (test-util/make-attrs
+                      app-id
+                      [[:item/id :unique? :index?]
+                       [:item/handle :unique? :index?]
+                       [:item/secret]
+                       [:item/note]
+                       [:item/data]
+                       [:owner/id :unique? :index?]
+                       [:owner/handle]
+                       [:tag/id :unique? :index?]
+                       [[:item/owner :owner/items] :on-delete]
+                       [[:item/tags :tag/items] :many]])
+            item-id  (attr->id :item/id)
+            handle   (attr->id :item/handle)
+            secret   (attr->id :item/secret)
+            note     (attr->id :item/note)
+            data     (attr->id :item/data)
+            owner-id (attr->id :owner/id)
+            owner    (attr->id :item/owner)
+            tags     (attr->id :item/tags)
+            rules!   (fn [code]
+                       (rule-model/put! (aurora/conn-pool :write) {:app-id app-id :code code}))
+            transact! (fn [tx-steps]
+                        (permissioned-tx/transact!
+                         {:db               {:conn-pool (aurora/conn-pool :write)}
+                          :app-id           app-id
+                          :attrs            (attr-model/get-by-app-id app-id)
+                          :datalog-query-fn d/query
+                          :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                          :current-user     nil}
+                         tx-steps))
+            insert!   (fn [& entities]
+                        (test-util/insert-entities app-id attr->id entities))
+            make-item! (fn make-item!
+                         ([]
+                          (make-item! {}))
+                         ([attrs]
+                          (let [item (random-uuid)]
+                            (insert! (merge {:db/id item :item/id item :item/secret "s" :item/note "n"}
+                                            attrs))
+                            item)))
+            stored    (fn [eid aid]
+                        (into #{}
+                              (map last)
+                              (fetch-triples app-id [[:= :entity-id eid] [:= :attr-id aid]])))]
+        (testing "the writes after the delete make a new entity"
+          (testing "which the create rule checks"
+            (rules! {:item {:allow {:create "false" :update "true" :delete "true"}}})
+            (let [item (make-item!)]
+              (is (perm-err? (transact! [[:delete-entity item "item"]
+                                         [:add-triple item item-id item]
+                                         [:add-triple item secret "new"]])))
+              (is (= #{"s"} (stored item secret)))
+              (is (perm-err? (transact! [[:delete-entity item "item"]
+                                         [:deep-merge-triple item data {:a 1}]])))
+              (is (= #{"s"} (stored item secret)))))
+          (testing "and the update rule doesn't"
+            (rules! {:item {:allow {:create "true" :update "false" :delete "true"}}})
+            (let [item (make-item!)]
+              (is (perm-pass? (transact! [[:delete-entity item "item"]
+                                          [:add-triple item item-id item]
+                                          [:add-triple item secret "new"]])))
+              (is (= #{"new"} (stored item secret)))
+              (is (= #{} (stored item note)))))
+          (testing "as it is stored"
+            ;; a secret of "x" is allowed only without a note
+            (rules! {:item {:allow {:create "data.secret != 'x' || data.note == null"
+                                    :update "false"
+                                    :delete "true"}}})
+            (let [item (make-item!)]
+              (is (perm-err? (transact! [[:delete-entity item "item"]
+                                         [:add-triple item item-id item]
+                                         [:add-triple item secret "x"]
+                                         [:add-triple item note "m"]])))
+              (is (= #{"s"} (stored item secret)))
+              (is (perm-pass? (transact! [[:delete-entity item "item"]
+                                          [:add-triple item item-id item]
+                                          [:add-triple item secret "x"]])))
+              (is (= #{"x"} (stored item secret)))
+              (is (= #{} (stored item note)))))
+          (testing "with no value of before the delete"
+            (let [tag-a (random-uuid)
+                  tag-b (random-uuid)
+                  _     (insert! {:db/id tag-a :tag/id tag-a} {:db/id tag-b :tag/id tag-b})
+                  steps (fn [item]
+                          [[:add-triple item tags tag-b]
+                           [:delete-entity item "item"]
+                           [:deep-merge-triple item data {"x" 1}]])]
+              (rules! {:item {:allow {:create "data.tags != null" :update "false" :delete "true"}}})
+              (let [item (make-item! {:item/tags tag-a})]
+                (is (perm-err? (transact! (steps item))))
+                (is (= #{tag-a} (stored item tags))))
+              (rules! {:item {:allow {:create "data.tags == null && data.note == null"
+                                      :update "false"
+                                      :delete "true"}}})
+              (let [item (make-item! {:item/tags tag-a})]
+                (is (perm-pass? (transact! (steps item))))
+                (is (= #{} (stored item tags)))
+                (is (= #{{"x" 1}} (stored item data))))))
+          (testing "under a lookup that found the entity"
+            (rules! {:item {:allow {:create "false" :update "newData.note != null" :delete "true"}}})
+            (let [item (make-item! {:item/handle "one"})]
+              (is (perm-err? (transact! [[:delete-entity item "item"]
+                                         [:add-triple [handle "one"] secret "x"]])))
+              (is (= #{"s"} (stored item secret)))
+              (is (= #{"n"} (stored item note))))))
+        (testing "the delete rule checks the entity as it was"
+          (let [steps (fn [item]
+                        [[:delete-entity item "item"]
+                         [:add-triple item item-id item]
+                         [:add-triple item secret "new"]])]
+            (rules! {:item {:allow {:create "true" :delete "data.secret == 'new'"}}})
+            (let [item (make-item!)]
+              (is (perm-err? (transact! (steps item))))
+              (is (= #{"s"} (stored item secret))))
+            (rules! {:item {:allow {:create "true" :delete "data.secret == 's'"}}})
+            (let [item (make-item!)]
+              (is (perm-pass? (transact! (steps item))))
+              (is (= #{"new"} (stored item secret))))))
+        (testing "a write before the delete changes the entity that was"
+          (let [steps (fn [item]
+                        [[:add-triple item secret "new"]
+                         [:delete-entity item "item"]])]
+            (rules! {:item {:allow {:create "true" :update "false" :delete "true"}}})
+            (let [item (make-item!)]
+              (is (perm-err? (transact! (steps item))))
+              (is (= #{"s"} (stored item secret))))
+            (rules! {:item {:allow {:create "false" :update "true" :delete "true"}}})
+            (let [item (make-item!)]
+              (is (perm-pass? (transact! (steps item))))
+              (is (= #{} (stored item item-id))))))
+        (testing "a link to the new entity is checked by the view rule on what it holds"
+          (let [steps (fn [item o]
+                        [[:delete-entity o "owner"]
+                         [:add-triple o owner-id o]
+                         [:add-triple item owner o]])
+                make! (fn []
+                        (let [o (random-uuid)]
+                          (insert! {:db/id o :owner/id o :owner/handle "h"})
+                          [(make-item!) o]))]
+            (rules! {:owner {:allow {:view "data.handle == 'h'"}}})
+            (let [[item o] (make!)]
+              (is (perm-err? (transact! (steps item o))))
+              (is (= #{} (stored item owner))))
+            (rules! {:owner {:allow {:view "data.handle == null"}}})
+            (let [[item o] (make!)]
+              (is (perm-pass? (transact! (steps item o))))
+              (is (= #{o} (stored item owner))))))
+        (testing "an entity that a cascade deletes is new too"
+          (rules! {:item {:allow {:create "false" :update "true" :delete "true"}}})
+          (let [o    (random-uuid)
+                _    (insert! {:db/id o :owner/id o})
+                item (make-item! {:item/owner o})]
+            (is (perm-err? (transact! [[:delete-entity o "owner"]
+                                       [:add-triple item note "m"]])))
+            (is (= #{"n"} (stored item note)))
+            (is (= #{(str o)} (stored o owner-id)))))))))
 
 (deftest idle-in-transaction-error
   (with-empty-app

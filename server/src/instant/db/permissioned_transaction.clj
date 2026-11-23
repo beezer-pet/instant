@@ -265,16 +265,28 @@
 
      {:entities <the entities ~approximating the ones post tx>
       :cleared  #{[eid aid]}, the attributes with one value whose value a
-                retract removes}
+                retract removes
+      :remade   #{{:eid :etype}}, the entities that are deleted and
+                written afterwards}
 
-   As in the database, a retract removes a value only where it names the
-   value that is held. Of an attribute with many values an entity holds the
-   last value that the transaction adds and doesn't retract afterwards."
+   As in the database, a retract removes a value only where it names the value
+   that is held. Of an attribute with many values an entity holds the last
+   value that the transaction adds and doesn't retract afterwards. An entity
+   that is written after its delete holds what is written from then on."
   [{:keys [attrs]} entities-map tx-steps]
-  (let [{:keys [entities many cleared]}
+  (let [{:keys [entities many cleared remade]}
         (reduce
          (fn [acc {:keys [op eid etype aid value]}]
            (let [key   {:eid eid :etype etype}
+                 ;; a write after the delete of its entity starts it anew
+                 acc   (if (and (#{:add-triple :deep-merge-triple} op)
+                                (contains? (:deleted acc) key))
+                         (-> acc
+                             (update :deleted disj key)
+                             (update :remade conj key)
+                             (update :entities assoc! key nil)
+                             (update :many #(into {} (remove (fn [[[k]]] (= key k))) %)))
+                         acc)
                  ;; apply lookup from eid as entity attr
                  acc   (if (and (lookup-ref? eid)
                                 (#{:add-triple :deep-merge-triple} op))
@@ -315,10 +327,15 @@
                      acc))
                  (update-in acc [:many [key label]] #(into [] (remove named?) %)))
 
+               :delete-entity
+               (update acc :deleted conj key)
+
                acc)))
          {:entities (transient entities-map)
           :many     {}
-          :cleared  #{}}
+          :cleared  #{}
+          :deleted  #{}
+          :remade   #{}}
          tx-steps)]
     {:entities (persistent!
                 (reduce-kv
@@ -328,7 +345,8 @@
                      entities))
                  entities
                  many))
-     :cleared  cleared}))
+     :cleared  cleared
+     :remade   remade}))
 
 (defn get-modified-fields-for-eid
   "Returns a list of field names being modified for a given entity.
@@ -455,21 +473,27 @@
       (ex/throw-validation-err! :lookup lookup [{:message "The transaction names the entity of this lookup in another way too"}]))))
 
 (defn pre-checks
-  "Checks that run before tx: update, delete for attrs & objects"
+  "Checks that run before tx: update, delete for attrs & objects. A `remade`
+   entity is deleted and written afterwards: its delete is checked on what
+   it was, and its writes make a new entity, which is checked after the tx."
   [{:keys [attrs admin? rules]}
    entities-map
    updated-entities-map
    rule-params-map
+   remade
    tx-steps]
   (for [tx-step tx-steps
         :let [{:keys [op eid aid etype value rev-etype]} tx-step
               key                {:eid eid :etype etype}
-              entity             (get entities-map key)
+              entity             (when (or (= :delete-entity op)
+                                           (not (remade key)))
+                                   (get entities-map key))
               ref?               (some? rev-etype)
               [_ _ fwd-label]    (:forward-identity (attr-model/seek-by-id aid attrs))
               [_ _ rev-label]    (:reverse-identity (attr-model/seek-by-id aid attrs))
               rev-key            {:eid value :etype rev-etype}
-              rev-entity         (when ref?
+              rev-entity         (when (and ref?
+                                            (not (remade rev-key)))
                                    (get entities-map rev-key))
               rule-params        (get rule-params-map key)
               rev-rule-params    (get rule-params-map rev-key)
@@ -885,7 +909,8 @@
                   ;; of the steps leaves them
                   ordered-tx-step-maps (tx/reorder-tx-steps ops-order tx-step-maps)
                   {updated-entities-map :entities
-                   cleared              :cleared}
+                   cleared              :cleared
+                   remade               :remade}
                   (update-entities-map ctx entities-map ordered-tx-step-maps)
                   rule-params-map      (persistent!
                                         (reduce
@@ -901,6 +926,7 @@
                                                    entities-map
                                                    updated-entities-map
                                                    rule-params-map
+                                                   remade
                                                    tx-step-maps)
                   pre-check-results    (io/expect-io
                                         (run-checks! ctx pre-checks))
@@ -923,7 +949,8 @@
                   _                    (when (seq lookups)
                                          (validate-names! tx-step-maps create-lookups-map))
                   post-checks          (post-create-checks ctx
-                                                           entities-map
+                                                           ;; a remade entity is new
+                                                           (apply dissoc entities-map remade)
                                                            updated-entities-map
                                                            rule-params-map
                                                            create-lookups-map
