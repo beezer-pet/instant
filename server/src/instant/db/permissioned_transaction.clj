@@ -396,6 +396,37 @@
                                 {:entity-id eid :attr-id aid}
                                 [{:message "The retract did not do what the permission checks expected of it"}]))))
 
+(defn validate-names!
+  "The rules check an entity under the name that the steps give it, its id or
+   a lookup, and a lookup that finds no entity before the transaction names a
+   new one. Where two of the names that the steps write or link turn out to
+   be one entity in the database, the checks would see it in parts, each with
+   the steps of one name, so the transaction is refused.
+
+   So is one that writes or links a lookup that `create-lookups-map` doesn't
+   hold, as where the transaction took the value from its entity, or the
+   database matched the lookup in another form than it is written in, 1.0
+   for 1."
+  [tx-steps create-lookups-map]
+  (let [named (fn [acc name etype]
+                (let [eid (if (lookup-ref? name)
+                            (or (get create-lookups-map name)
+                                (ex/throw-validation-err! :lookup name [{:message "Could not find the entity for this lookup"}]))
+                            name)]
+                  (update acc [eid etype] (fnil conj #{}) name)))
+        names (reduce (fn [acc {:keys [op eid etype value rev-etype]}]
+                        (if (#{:add-triple :deep-merge-triple} op)
+                          (cond-> (named acc eid etype)
+                            rev-etype (named value rev-etype))
+                          acc))
+                      {}
+                      tx-steps)]
+    (when-some [lookup (some (fn [[_ names]]
+                               (when (next names)
+                                 (some #(when (lookup-ref? %) %) names)))
+                             names)]
+      (ex/throw-validation-err! :lookup lookup [{:message "The transaction names the entity of this lookup in another way too"}]))))
+
 (defn pre-checks
   "Checks that run before tx: update, delete for attrs & objects"
   [{:keys [attrs admin? rules]}
@@ -854,11 +885,16 @@
                   _                    (validate-retracted! ctx entities-map cleared tx-step-maps tx-data)
 
                   ;; post checks
+                  lookups              (->> tx-step-maps
+                                            (mapcat (fn [{:keys [eid value rev-etype]}]
+                                                      (if rev-etype
+                                                        [eid value]
+                                                        [eid])))
+                                            (filter lookup-ref?))
                   create-lookups-map   (io/expect-io
-                                        (->> tx-step-maps
-                                             (map :eid)
-                                             (filter lookup-ref?)
-                                             (triple-model/fetch-lookups->eid tx-conn app-id)))
+                                        (triple-model/fetch-lookups->eid tx-conn app-id lookups))
+                  _                    (when (seq lookups)
+                                         (validate-names! tx-step-maps create-lookups-map))
                   post-checks          (post-create-checks ctx
                                                            entities-map
                                                            updated-entities-map

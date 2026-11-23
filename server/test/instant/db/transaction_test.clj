@@ -6139,6 +6139,222 @@
                 (is (validation-err? (transact! [[:retract-triple item data (array-map "b" 1 "a" 2)]]))))
               (is (= #{{"a" 2 "b" 1}} (stored item data))))))))))
 
+;; The rules check an entity under the name its steps give it, its id or a
+;; lookup. Under two names it would be checked in parts, each with the steps
+;; of one name.
+(deftest entity-written-under-two-names
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id (test-util/make-attrs
+                      app-id
+                      [[:item/id :unique? :index?]
+                       [:item/handle :unique? :index?]
+                       [:item/email :unique? :index?]
+                       [:item/num :unique? :index?]
+                       [:item/secret]
+                       [:item/note]
+                       [:owner/id :unique? :index?]
+                       [:owner/handle :unique? :index?]
+                       [:owner/num :unique? :index?]
+                       [[:item/owner :owner/items]]])
+            item-id  (attr->id :item/id)
+            handle   (attr->id :item/handle)
+            email    (attr->id :item/email)
+            num      (attr->id :item/num)
+            secret   (attr->id :item/secret)
+            note     (attr->id :item/note)
+            owner-id (attr->id :owner/id)
+            owner-handle (attr->id :owner/handle)
+            owner-num (attr->id :owner/num)
+            owner    (attr->id :item/owner)
+            rules!   (fn [code]
+                       (rule-model/put! (aurora/conn-pool :write) {:app-id app-id :code code}))
+            ;; a secret of "x" is allowed only without a note
+            alone    (fn [data]
+                       (str data ".secret != 'x' || " data ".note == null"))
+            transact! (fn [tx-steps]
+                        (permissioned-tx/transact!
+                         {:db               {:conn-pool (aurora/conn-pool :write)}
+                          :app-id           app-id
+                          :attrs            (attr-model/get-by-app-id app-id)
+                          :datalog-query-fn d/query
+                          :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                          :current-user     nil}
+                         tx-steps))
+            ;; the secret and the note of the entity that holds `value`
+            stored    (fn [aid value]
+                        (let [[eid] (first (filter (fn [[_ _ v]]
+                                                     (= (str value) (str v)))
+                                                   (fetch-triples app-id [[:= :attr-id aid]])))]
+                          (into {}
+                                (for [[_ a v] (when eid
+                                                (fetch-triples app-id [[:= :entity-id eid]]))
+                                      :when (#{secret note} a)]
+                                  [(if (= secret a) :secret :note) v]))))
+            exists?   (fn [eid]
+                        (boolean (seq (fetch-triples app-id [[:= :entity-id eid]]))))
+            message   (fn [res]
+                        (-> res ex-data ::ex/hint :errors first :message))
+            two-names? (fn [res]
+                         (= "The transaction names the entity of this lookup in another way too"
+                            (message res)))
+            not-found? (fn [res]
+                         (= "Could not find the entity for this lookup"
+                            (message res)))]
+        (rules! {:item {:allow {:create (alone "data")
+                                :update (alone "newData")}}})
+        (testing "under one name the rule sees all that is written"
+          (testing "its id"
+            (let [item (random-uuid)]
+              (is (perm-err? (transact! [[:add-triple item item-id item]
+                                         [:add-triple item secret "x"]
+                                         [:add-triple item note "n"]])))
+              (is (perm-pass? (transact! [[:add-triple item item-id item]
+                                          [:add-triple item secret "x"]])))
+              (is (= {:secret "x"} (stored item-id item)))))
+          (testing "a lookup on its id"
+            (let [item (random-uuid)]
+              (is (perm-err? (transact! [[:add-triple [item-id item] secret "x"]
+                                         [:add-triple [item-id item] note "n"]])))
+              (is (perm-pass? (transact! [[:add-triple [item-id item] secret "x"]])))
+              (is (= {:secret "x"} (stored item-id item)))))
+          (testing "a lookup on another unique attribute"
+            (is (perm-err? (transact! [[:add-triple [handle "one"] secret "x"]
+                                       [:deep-merge-triple [handle "one"] note "n"]])))
+            (is (perm-pass? (transact! [[:add-triple [handle "one"] secret "x"]])))
+            (is (= {:secret "x"} (stored handle "one")))))
+        (testing "a new entity written under two names is refused"
+          (testing "its id and a lookup on its id"
+            (let [item (random-uuid)]
+              (is (two-names? (validation-err? (transact! [[:add-triple item secret "x"]
+                                                           [:add-triple [item-id item] note "n"]]))))
+              (is (not (exists? item))))
+            (let [item (random-uuid)]
+              (is (two-names? (validation-err? (transact! [[:add-triple [item-id item] note "n"]
+                                                           [:deep-merge-triple item secret "x"]]))))
+              (is (not (exists? item)))))
+          (testing "its id and a lookup on another unique attribute"
+            (let [item (random-uuid)]
+              (is (two-names? (validation-err? (transact! [[:add-triple item item-id item]
+                                                           [:add-triple item handle "two"]
+                                                           [:add-triple item secret "x"]
+                                                           [:deep-merge-triple [handle "two"] note "n"]]))))
+              (is (not (exists? item)))))
+          (testing "two lookups"
+            (is (two-names? (validation-err? (transact! [[:add-triple [handle "three"] email "three@example.com"]
+                                                         [:add-triple [handle "three"] secret "x"]
+                                                         [:deep-merge-triple [email "three@example.com"] note "n"]]))))
+            (is (= {} (stored handle "three")))))
+        (testing "an entity that exists"
+          (testing "is one entity under its id and a lookup that finds it"
+            (let [item (random-uuid)]
+              (test-util/insert-entities app-id attr->id [{:db/id item :item/id item :item/handle "four"}])
+              (is (perm-err? (transact! [[:add-triple item secret "x"]
+                                         [:add-triple [handle "four"] note "n"]])))
+              (is (= {} (stored item-id item)))
+              (is (perm-pass? (transact! [[:add-triple item secret "y"]
+                                          [:add-triple [handle "four"] note "n"]])))
+              (is (= {:secret "y" :note "n"} (stored item-id item)))))
+          (testing "is refused under its id and a lookup that the transaction lets find it"
+            (let [item (random-uuid)]
+              (test-util/insert-entities app-id attr->id [{:db/id item :item/id item :item/handle "five"}])
+              (is (two-names? (validation-err? (transact! [[:add-triple item handle "six"]
+                                                           [:add-triple item secret "x"]
+                                                           [:deep-merge-triple [handle "six"] note "n"]]))))
+              (is (= {} (stored item-id item)))
+              (is (= #{"five"}
+                     (into #{}
+                           (map last)
+                           (fetch-triples app-id [[:= :entity-id item] [:= :attr-id handle]])))))))
+        (testing "two new entities, one under its id and one under a lookup, are stored"
+          (let [item (random-uuid)]
+            (is (perm-pass? (transact! [[:add-triple item item-id item]
+                                        [:add-triple item secret "x"]
+                                        [:add-triple [handle "seven"] note "n"]])))
+            (is (= {:secret "x"} (stored item-id item)))
+            (is (= {:note "n"} (stored handle "seven")))))
+        (testing "a lookup that the database matches in another form is refused"
+          (testing "as the name of an entity"
+            (rules! {:item  {:allow {:create "data.secret != 'x' || data.owner == null"}}
+                     :owner {:allow {:link {:items "true"}}}})
+            (let [item (random-uuid)
+                  o    (random-uuid)]
+              (test-util/insert-entities app-id attr->id [{:db/id o :owner/id o}])
+              (is (perm-err? (transact! [[:add-triple item item-id item]
+                                         [:add-triple item secret "x"]
+                                         [:add-triple item owner o]])))
+              (is (two-names? (validation-err? (transact! [[:deep-merge-triple item num 1]
+                                                           [:deep-merge-triple item secret "x"]
+                                                           [:add-triple [num 1] owner o]]))))
+              (is (not-found? (validation-err? (transact! [[:deep-merge-triple item num 1]
+                                                           [:deep-merge-triple item secret "x"]
+                                                           [:add-triple [num 1.0] owner o]]))))
+              (is (not (exists? item)))))
+          (testing "as the entity that is linked"
+            (rules! {:owner {:allow {:view "false"}}})
+            (let [item (random-uuid)
+                  o    (random-uuid)]
+              (is (not-found? (validation-err? (transact! [[:deep-merge-triple o owner-num 2]
+                                                           [:add-triple item item-id item]
+                                                           [:add-triple item owner [owner-num 2.0]]]))))
+              (is (not-found? (validation-err? (transact! [[:add-triple [owner-num 3] owner-handle "three"]
+                                                           [:add-triple item item-id item]
+                                                           [:add-triple item owner [owner-num 3.0]]]))))
+              (is (not (exists? item)))
+              (is (not (exists? o))))))
+        (testing "a new entity that is linked"
+          (testing "is checked where the link names it as its steps do"
+            (rules! {:owner {:allow {:view "false"}}})
+            (let [item (random-uuid)
+                  o    (random-uuid)]
+              (testing "by its id"
+                (is (perm-err? (transact! [[:add-triple o owner-id o]
+                                           [:add-triple item item-id item]
+                                           [:add-triple item owner o]])))
+                (is (perm-err? (transact! [[:deep-merge-triple o owner-handle "eight"]
+                                           [:add-triple item item-id item]
+                                           [:add-triple item owner o]]))))
+              (testing "by a lookup"
+                (is (perm-err? (transact! [[:add-triple [owner-handle "eight"] owner-id [owner-handle "eight"]]
+                                           [:add-triple item item-id item]
+                                           [:add-triple item owner [owner-handle "eight"]]]))))
+              (is (not (exists? item)))
+              (is (not (exists? o))))
+            (rules! {:owner {:allow {:link {:items "false"}}}})
+            (let [item (random-uuid)
+                  o    (random-uuid)]
+              (is (perm-err? (transact! [[:add-triple o owner-id o]
+                                         [:add-triple item item-id item]
+                                         [:add-triple item owner o]])))
+              (is (not (exists? item)))))
+          (testing "is refused where the link names it in another way"
+            (doseq [code [{:owner {:allow {:view "false"}}}
+                          {:owner {:allow {:link {:items "false"}}}}]]
+              (rules! code)
+              (testing "written under a lookup on its id, linked by its id"
+                (let [item (random-uuid)
+                      o    (random-uuid)]
+                  (is (two-names? (validation-err? (transact! [[:add-triple [owner-id o] owner-handle "nine"]
+                                                               [:add-triple item item-id item]
+                                                               [:add-triple item owner o]]))))
+                  (is (not (exists? item)))
+                  (is (not (exists? o)))))
+              (testing "written under its id, linked by a lookup that the transaction lets find it"
+                (let [item (random-uuid)
+                      o    (random-uuid)]
+                  (is (two-names? (validation-err? (transact! [[:deep-merge-triple o owner-handle "ten"]
+                                                               [:add-triple item item-id item]
+                                                               [:add-triple item owner [owner-handle "ten"]]]))))
+                  (is (not (exists? item)))
+                  (is (not (exists? o)))))
+              (testing "linked from an entity that exists"
+                (let [item (random-uuid)
+                      o    (random-uuid)]
+                  (test-util/insert-entities app-id attr->id [{:db/id item :item/id item}])
+                  (is (two-names? (validation-err? (transact! [[:add-triple [owner-id o] owner-handle "eleven"]
+                                                               [:add-triple item owner o]]))))
+                  (is (not (exists? o))))))))))))
+
 (deftest idle-in-transaction-error
   (with-empty-app
     (fn [{app-id   :id
