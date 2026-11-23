@@ -51,7 +51,7 @@
            "Sendgrid is disabled, add sendgrid-token to config to enable"}}))
       (tracer/with-span!
         {:name "sendgrid/send"
-         :attributes {:body body}}
+         :attributes {:body (dissoc body :subject :content)}}
         (try
           (clj-http/post
            "https://api.sendgrid.com/v3/mail/send"

@@ -103,7 +103,7 @@
           {:msg
            "Postmark is disabled, add postmark-token to config to enable"}}))
       (tracer/with-span! {:name "postmark/send"
-                          :attributes body}
+                          :attributes (dissoc body :Subject :HTMLBody :TextBody)}
         (try
           (clj-http/post
            "https://api.postmarkapp.com/email"
