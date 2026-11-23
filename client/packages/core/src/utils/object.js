@@ -25,6 +25,15 @@ export function areObjectsDeepEqual(obj1, obj2) {
     return obj1 === obj2;
   }
 
+  // A Date has no keys to compare.
+  if (obj1 instanceof Date || obj2 instanceof Date) {
+    return (
+      obj1 instanceof Date &&
+      obj2 instanceof Date &&
+      Object.is(obj1.getTime(), obj2.getTime())
+    );
+  }
+
   if (!areObjectKeysEqual(obj1, obj2)) {
     return false;
   }

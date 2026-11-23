@@ -1,10 +1,37 @@
 import { test, expect, describe } from 'vitest';
 
 import {
+  areObjectsDeepEqual,
   assocInMutative,
   dissocInMutative,
   insertInMutative,
 } from '../../../src/utils/object';
+
+describe('areObjectsDeepEqual', () => {
+  test('compares nested values', () => {
+    expect(
+      areObjectsDeepEqual({ a: [1, { b: null }] }, { a: [1, { b: null }] }),
+    ).toBe(true);
+    expect(
+      areObjectsDeepEqual({ a: [1, { b: null }] }, { a: [1, { b: 2 }] }),
+    ).toBe(false);
+    expect(areObjectsDeepEqual({ a: 1 }, { a: 1, b: 2 })).toBe(false);
+  });
+
+  test('compares dates by their time', () => {
+    const at = (ms) => ({ users: [{ createdAt: new Date(ms) }] });
+    expect(areObjectsDeepEqual(at(1000), at(1000))).toBe(true);
+    expect(areObjectsDeepEqual(at(1000), at(2000))).toBe(false);
+    expect(areObjectsDeepEqual(new Date(NaN), new Date(NaN))).toBe(true);
+    expect(areObjectsDeepEqual(new Date(1000), new Date(NaN))).toBe(false);
+  });
+
+  test('a date equals nothing but a date', () => {
+    expect(areObjectsDeepEqual(new Date(1000), {})).toBe(false);
+    expect(areObjectsDeepEqual({}, new Date(1000))).toBe(false);
+    expect(areObjectsDeepEqual(new Date(1000), 1000)).toBe(false);
+  });
+});
 
 describe('assocInMutative', () => {
   test('adds value at a shallow path', () => {

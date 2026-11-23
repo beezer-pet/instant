@@ -357,6 +357,75 @@ test('optimisticTx is not overwritten by refresh-ok', async () => {
   ]);
 });
 
+test('a subscription is told of a change in a date alone', async () => {
+  const joe_id = 'ce942051-2d74-404a-9c7d-4aa3f2d54ae4';
+  const createdAtId = '2ffdf0fc-1561-4fc5-96db-2210a41adfa6';
+  const attrs = zenecaAttrs.map((attr) =>
+    attr.id === createdAtId ? { ...attr, 'checked-data-type': 'date' } : attr,
+  );
+  const reactor = new Reactor({ appId: uuid(), useDateObjects: true });
+  reactor._initStorage(IndexedDBStorage);
+  reactor._setAttrs(attrs);
+  const q = { users: {} };
+
+  await waitForLoaded(reactor);
+
+  const seen = [];
+  reactor.subscribeQuery(q, (res) => {
+    seen.push(res.data.users.find((user) => user.id === joe_id).createdAt);
+  });
+
+  // The store writes its dates into the triples it is given.
+  const result = (triples) => [
+    {
+      data: {
+        'datalog-result': {
+          'join-rows': [triples.map((triple) => [...triple])],
+        },
+      },
+      'child-nodes': [],
+    },
+  ];
+
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q,
+    'processed-tx-id': 0,
+    result: result(zenecaTriples),
+  });
+  await reactor.querySubs.flush();
+
+  const refresh = (createdAt) =>
+    reactor._handleReceive(1, {
+      op: 'refresh-ok',
+      'processed-tx-id': 1,
+      attrs,
+      computations: [
+        {
+          'instaql-query': q,
+          'instaql-result': result(
+            zenecaTriples.map((triple) =>
+              triple[0] === joe_id && triple[1] === createdAtId
+                ? [triple[0], triple[1], createdAt, triple[3]]
+                : triple,
+            ),
+          ),
+        },
+      ],
+    });
+
+  refresh('2021-01-14 18:51:23.742637');
+  await waitForLoaded(reactor);
+  // the same moment again is no change
+  refresh('2021-01-14 18:51:23.742637');
+  await waitForLoaded(reactor);
+
+  expect(seen).toEqual([
+    new Date('2021-01-07T18:51:23.742Z'),
+    new Date('2021-01-14T18:51:23.742Z'),
+  ]);
+});
+
 test("we don't cleanup mutations we're still waiting on", async () => {
   const appId = uuid();
   const reactor = new Reactor({
