@@ -143,10 +143,23 @@
                                            being set")}])))
   tx-steps)
 
+(defn- id-lookup->eid
+  "The entity id that a lookup on an id attribute names: the database takes
+   the entity of such a lookup from its value where no triple holds it."
+  [{:keys [attrs]} eid]
+  (when (lookup-ref? eid)
+    (let [[aid value] eid]
+      (when (= "id" (attr-model/fwd-label (attr-model/seek-by-id aid attrs)))
+        (uuid-util/coerce value)))))
+
 (defn load-entities-map
   "Takes tx-steps, fetches from DB map of
 
-     {{:eid :etype} -> <entity map>}"
+     {{:eid :etype} -> <entity map>}
+
+   A lookup on an id attribute that finds no entity is given the entity of
+   that id, which can hold values of the etype's attributes with one value
+   without its id."
   [{:keys [datalog-query-fn attrs] :as ctx} tx-steps]
   (let [;; An entity appears in one tx-step per attribute written, so fetch
         ;; each entity once rather than once per step.
@@ -157,11 +170,19 @@
                                          [[eid etype]
                                           [value rev-etype]]
                                          [[eid etype]])]
-                       {:eid eid :etype etype}))]
+                       {:eid eid :etype etype}))
+        id-keys     (into {}
+                          (for [{:keys [eid etype] :as key} eids+etypes
+                                :let [id (id-lookup->eid ctx eid)]
+                                :when id]
+                            [key {:eid id :etype etype}]))
+        fetched     (if (seq id-keys)
+                      (distinct (concat eids+etypes (vals id-keys)))
+                      eids+etypes)]
     (when (seq eids+etypes)
       (let [query {:children
                    {:pattern-groups
-                    (for [{:keys [eid etype]} eids+etypes]
+                    (for [{:keys [eid etype]} fetched]
                       {:patterns
                        [[:ea eid (attr-model/ea-ids-for-etype etype attrs)]]})}}
             ;; you might be tempted to simplify the query to [[:ea (set eids)]]
@@ -171,15 +192,21 @@
                                (d/scoped-permission-entity-fetch-enabled? (:app-id ctx)))
                         (assoc ctx ::d/permission-entity-fetch? true)
                         ctx)
-            datalog-result (datalog-query-fn query-ctx query)]
-        (zipmap
-         eids+etypes
-         (for [data (:data datalog-result)
-               :let [rows    (:join-rows (:result data))
-                     triples (mapcat identity rows)]]
-           (when (seq triples)
-             (-> (entity-model/triples->map ctx triples)
-                 (assoc "id" (ffirst triples))))))))))
+            datalog-result (datalog-query-fn query-ctx query)
+            entities (zipmap
+                      fetched
+                      (for [data (:data datalog-result)
+                            :let [rows    (:join-rows (:result data))
+                                  triples (mapcat identity rows)]]
+                        (when (seq triples)
+                          (-> (entity-model/triples->map ctx triples)
+                              (assoc "id" (ffirst triples))))))]
+        (if (seq id-keys)
+          (into {}
+                (for [key eids+etypes]
+                  [key (or (get entities key)
+                           (get entities (get id-keys key)))]))
+          entities)))))
 
 (defn resolve-lookups-tx-steps
   "Given known entities-map, resolves as much lookup-refs as possible"

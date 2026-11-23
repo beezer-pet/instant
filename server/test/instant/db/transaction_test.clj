@@ -6355,6 +6355,91 @@
                                                                [:add-triple item owner o]]))))
                   (is (not (exists? o))))))))))))
 
+;; Where no id triple holds the value of a lookup on an id attribute, the
+;; database writes to the entity of that id, which can hold other values.
+(deftest entity-without-its-id-under-a-lookup-on-its-id
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id (test-util/make-attrs
+                      app-id
+                      [[:item/id :unique? :index?]
+                       [:item/handle :unique? :index?]
+                       [:item/secret]
+                       [:item/note]
+                       [:owner/id :unique? :index?]
+                       [:owner/handle :unique? :index?]
+                       [[:item/owner :owner/items]]])
+            item-id  (attr->id :item/id)
+            secret   (attr->id :item/secret)
+            note     (attr->id :item/note)
+            owner-id (attr->id :owner/id)
+            owner    (attr->id :item/owner)
+            rules!   (fn [code]
+                       (rule-model/put! (aurora/conn-pool :write) {:app-id app-id :code code}))
+            ;; a secret of "x" is allowed only without a note
+            alone    (fn [data]
+                       (str data ".secret != 'x' || " data ".note == null"))
+            transact! (fn [tx-steps]
+                        (permissioned-tx/transact!
+                         {:db               {:conn-pool (aurora/conn-pool :write)}
+                          :app-id           app-id
+                          :attrs            (attr-model/get-by-app-id app-id)
+                          :datalog-query-fn d/query
+                          :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                          :current-user     nil}
+                         tx-steps))
+            insert!   (fn [& entities]
+                        (test-util/insert-entities app-id attr->id entities))
+            stored    (fn [eid aid]
+                        (into #{}
+                              (map last)
+                              (fetch-triples app-id [[:= :entity-id eid] [:= :attr-id aid]])))]
+        (testing "its change is checked by the update rule"
+          (rules! {:item {:allow {:create "true" :update "false"}}})
+          (testing "of an entity that holds a value"
+            (let [item (random-uuid)]
+              (insert! {:db/id item :item/handle "one"})
+              (is (perm-err? (transact! [[:add-triple [item-id item] note "n"]])))
+              (is (= #{} (stored item note)))))
+          (testing "of an entity that holds only a link"
+            (let [item (random-uuid)
+                  o    (random-uuid)]
+              (insert! {:db/id o :owner/id o} {:db/id item :item/owner o})
+              (is (perm-err? (transact! [[:add-triple [item-id item] note "n"]])))
+              (is (= #{} (stored item note)))))
+          (testing "and an entity that holds nothing is new"
+            (let [item (random-uuid)]
+              (is (perm-pass? (transact! [[:add-triple [item-id item] note "n"]])))
+              (is (= #{"n"} (stored item note)))
+              (is (= #{(str item)} (stored item item-id))))))
+        (testing "the rule sees what the entity holds"
+          (rules! {:item {:allow {:create (alone "data")
+                                  :update (alone "newData")}}})
+          (let [item (random-uuid)]
+            (insert! {:db/id item :item/handle "two" :item/note "n"})
+            (is (perm-err? (transact! [[:add-triple [item-id item] secret "x"]])))
+            (is (= #{} (stored item secret)))
+            (is (perm-pass? (transact! [[:add-triple [item-id item] secret "y"]])))
+            (is (= #{"y"} (stored item secret)))
+            (is (= #{"n"} (stored item note))))
+          (testing "with the steps under its id"
+            (let [item (random-uuid)]
+              (insert! {:db/id item :item/handle "three"})
+              (is (perm-err? (transact! [[:add-triple item secret "x"]
+                                         [:add-triple [item-id item] note "n"]])))
+              (is (= #{} (stored item secret)))
+              (is (= #{} (stored item note))))))
+        (testing "a link to it is checked by the view rule"
+          (let [item (random-uuid)
+                o    (random-uuid)]
+            (insert! {:db/id item :item/id item} {:db/id o :owner/handle "four"})
+            (rules! {:owner {:allow {:view "false"}}})
+            (is (perm-err? (transact! [[:add-triple item owner [owner-id o]]])))
+            (is (= #{} (stored item owner)))
+            (rules! {:owner {:allow {:view "true"}}})
+            (is (perm-pass? (transact! [[:add-triple item owner [owner-id o]]])))
+            (is (= #{o} (stored item owner)))))))))
+
 (deftest idle-in-transaction-error
   (with-empty-app
     (fn [{app-id   :id
