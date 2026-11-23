@@ -9,7 +9,7 @@ import {
   InstantSchemaDef,
   ValidQuery,
 } from '@instantdb/core';
-import { useCallback, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useMemo, useRef, useSyncExternalStore } from 'react';
 
 const defaultState = {
   isLoading: true,
@@ -48,22 +48,23 @@ export function useQueryInternal<
   const query = _query ? coerceQuery(_query) : null;
   const queryHash = weakHash(query);
 
+  // What the store holds for the query when a render first asks it, until
+  // the subscription to it puts its results in `resultCacheRef`.
+  const storedResult = useMemo(
+    () => stateForResult(_core._reactor.getPreviousResult(query)),
+    [queryHash],
+  );
+
   // We use a ref to store the result of the query.
   // This is becuase `useSyncExternalStore` uses `Object.is`
   // to compare the previous and next state.
   // If we don't use a ref, the state will always be considered different, so
   // the component will always re-render.
-  //
-  // Initialised lazily: useRef's argument is evaluated on every render, and
-  // getPreviousResult runs the query against the local store.
   const resultCacheRef = useRef<InstaQLLifecycleState<Schema, Q, UseDates>>(
     null!,
   );
-  if (resultCacheRef.current === null) {
-    resultCacheRef.current = stateForResult(
-      _core._reactor.getPreviousResult(query),
-    );
-  }
+  // The hash of the query that the result in `resultCacheRef` is for.
+  const resultHashRef = useRef<string>(null!);
 
   // Cache the server snapshot to satisfy useSyncExternalStore's requirement
   // that getServerSnapshot returns the same reference across calls.
@@ -79,6 +80,7 @@ export function useQueryInternal<
       resultCacheRef.current = stateForResult(
         _core._reactor.getPreviousResult(query),
       );
+      resultHashRef.current = queryHash;
       // before the subscribeQuery is connected and calls it's own callback,
       // we might have data in the store via SSR, we need to notify useSyncExternalStore that
       // the data has changed.
@@ -101,6 +103,7 @@ export function useQueryInternal<
           error: undefined,
           ...result,
         };
+        resultHashRef.current = queryHash;
 
         cb();
       });
@@ -115,7 +118,10 @@ export function useQueryInternal<
     InstaQLLifecycleState<Schema, Q, UseDates>
   >(
     subscribe,
-    () => resultCacheRef.current,
+    () =>
+      resultHashRef.current === queryHash
+        ? resultCacheRef.current
+        : storedResult,
     () => {
       if (serverSnapshot && serverSnapshotCacheRef.current === defaultState) {
         const result = serverSnapshot();
