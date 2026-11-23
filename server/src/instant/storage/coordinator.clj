@@ -8,6 +8,7 @@
             [instant.db.model.attr :as attr-model]
             [instant.db.datalog :as d]
             [instant.db.cel :as cel]
+            [instant.db.permissioned-transaction :as permissioned-tx]
             [instant.jdbc.aurora :as aurora]
             [instant.model.app-upload-url :as app-upload-url-model]
             [instant.config :as config]
@@ -102,27 +103,42 @@
                                               :metadata metadata})
                         (ex-cause e)))))))
 
+(defn- delete-files-with-rules!
+  "Deletes the files at paths in one transaction of current-user, which asks
+   the delete rule of each file and of each entity that the delete cascades
+   to. Returns the ids of the deleted files."
+  [{:keys [app-id paths current-user]}]
+  (let [attrs (attr-model/get-by-app-id app-id)
+        path-attr-id (attr-model/resolve-attr-id attrs "$files" "path")
+        id-attr-id (attr-model/resolve-attr-id attrs "$files" "id")
+        tx-data (permissioned-tx/transact!
+                 {:db {:conn-pool (aurora/conn-pool :write)}
+                  :app-id app-id
+                  :attrs attrs
+                  :datalog-query-fn d/query
+                  :rules (rule-model/get-by-app-id {:app-id app-id})
+                  :current-user current-user}
+                 (mapv (fn [path]
+                         [:delete-entity [path-attr-id path] "$files"])
+                       paths))]
+    (->> (get-in tx-data [:results :delete-entity])
+         (filter #(= id-attr-id (:attr_id %)))
+         (mapv :entity_id))))
+
 (defn delete-files!
   "Deletes multiple files from Instant. S3 cleanup is handled by the storage sweeper."
-  [{:keys [app-id paths current-user skip-perms-check?]}]
+  [{:keys [app-id paths skip-perms-check?] :as params}]
   (storage-beta/assert-storage-enabled! app-id)
-  (when (not skip-perms-check?)
-    (doseq [path paths]
-      (assert-storage-permission! "delete" {:app-id app-id
-                                            :path path
-                                            :current-user current-user})))
-  (let [deleted (app-file-model/delete-by-paths! {:app-id app-id :paths paths})]
-    {:ids (mapv :id deleted)}))
+  {:ids (if skip-perms-check?
+          (mapv :id (app-file-model/delete-by-paths! {:app-id app-id :paths paths}))
+          (delete-files-with-rules! params))})
 
 (defn delete-file!
   "Deletes a file from Instant. S3 cleanup is handled by the storage sweeper."
-  [{:keys [app-id path current-user skip-perms-check?]}]
-  (when (not skip-perms-check?)
-    (assert-storage-permission! "delete" {:app-id app-id
-                                          :path path
-                                          :current-user current-user}))
-  (let [{:keys [id]} (app-file-model/delete-by-path! {:app-id app-id :path path})]
-    {:id id}))
+  [{:keys [app-id path skip-perms-check?] :as params}]
+  {:id (if skip-perms-check?
+         (:id (app-file-model/delete-by-path! {:app-id app-id :path path}))
+         (first (delete-files-with-rules! (assoc params :paths [path]))))})
 
 ;; Logic for legacy S3 upload/download URLs
 ;; -------------------------

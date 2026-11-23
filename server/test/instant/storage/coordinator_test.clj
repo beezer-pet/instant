@@ -3,10 +3,11 @@
             [instant.storage.coordinator :as coordinator]
             [instant.fixtures :refer [with-empty-app]]
             [instant.flags :as flags]
+            [instant.model.app-file :as app-file-model]
             [instant.model.app-user :as app-user-model]
             [instant.model.rule :as rule-model]
             [instant.util.exception :as ex]
-            [instant.util.test :as test-util :refer [perm-err? validation-err? instant-ex-data make-attrs insert-entities suid]])
+            [instant.util.test :as test-util :refer [perm-err? validation-err? instant-ex-data make-attrs insert-entities find-entids-by-ids suid]])
   (:import
    (java.io ByteArrayInputStream)))
 
@@ -188,6 +189,92 @@
             (testing "a file that the server stores for a stream has no limit"
               (is (uuid? (:id (upload! 6 :skip-size-check? true))))
               (is (= 4 @uploads)))))))))
+
+(deftest storage-delete-asks-the-delete-rule-of-cascaded-entities
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id (make-attrs app-id
+                                 [[:documents/title]
+                                  [[:documents/file :$files/documents] :on-delete]])
+            user (app-user-model/create!
+                  {:app-id app-id
+                   :id (suid "1")
+                   :email "user@example.com"})
+            create-file! (fn [path]
+                           (:id (app-file-model/create!
+                                 {:app-id app-id
+                                  :path path
+                                  :location-id (str (random-uuid))
+                                  :metadata {:size 5
+                                             :content-type "image/png"
+                                             :content-disposition "inline"}})))
+            create-document! (fn [id file-id]
+                               (insert-entities app-id attr->id
+                                                [{:db/id id
+                                                  :documents/title "Passport"
+                                                  :documents/file file-id}]))
+            put-rules! (fn [files-delete documents-delete]
+                         (rule-model/put!
+                          {:app-id app-id
+                           :code {"$files" {"allow" {"delete" files-delete}}
+                                  "documents" {"allow" {"delete" documents-delete}}}}))
+            existing (fn [& ids]
+                       (find-entids-by-ids app-id attr->id ids))
+            doc-id (suid "d")
+            with-doc (create-file! "with-document.png")
+            alone (create-file! "alone.png")]
+        (create-document! doc-id with-doc)
+
+        (testing "a file is kept when the entity that its delete cascades to may not be deleted"
+          (put-rules! "true" "false")
+          (is (perm-err? (coordinator/delete-file! {:app-id app-id
+                                                    :path "with-document.png"
+                                                    :current-user user})))
+          (is (perm-err? (coordinator/delete-files! {:app-id app-id
+                                                     :paths ["alone.png" "with-document.png"]
+                                                     :current-user user})))
+          (is (= #{with-doc alone doc-id} (existing with-doc alone doc-id))))
+
+        (testing "a file's own delete rule is asked, with the whole file as its data"
+          (put-rules! "data.path == 'alone.png' && data.size == 5" "true")
+          (is (perm-err? (coordinator/delete-file! {:app-id app-id
+                                                    :path "with-document.png"
+                                                    :current-user user})))
+          (is (= {:id alone} (coordinator/delete-file! {:app-id app-id
+                                                        :path "alone.png"
+                                                        :current-user user})))
+          (is (= #{with-doc doc-id} (existing with-doc alone doc-id))))
+
+        (testing "a file without rules is kept"
+          (rule-model/put! {:app-id app-id :code {}})
+          (is (perm-err? (coordinator/delete-file! {:app-id app-id
+                                                    :path "with-document.png"
+                                                    :current-user user}))))
+
+        (testing "the file and the entity are deleted when both rules allow it"
+          (put-rules! "true" "true")
+          (is (= {:ids [with-doc]} (coordinator/delete-files! {:app-id app-id
+                                                              :paths ["with-document.png"]
+                                                              :current-user user})))
+          (is (= #{} (existing with-doc doc-id))))
+
+        (testing "a path without a file deletes nothing and asks no rule"
+          (put-rules! "false" "false")
+          (is (= {:id nil} (coordinator/delete-file! {:app-id app-id
+                                                      :path "with-document.png"
+                                                      :current-user user})))
+          (is (= {:ids []} (coordinator/delete-files! {:app-id app-id
+                                                       :paths ["with-document.png"]
+                                                       :current-user user}))))
+
+        (testing "an admin's delete asks no rule"
+          (put-rules! "false" "false")
+          (let [file-id (create-file! "admin.png")]
+            (create-document! doc-id file-id)
+            (is (= {:id file-id} (coordinator/delete-file! {:app-id app-id
+                                                            :path "admin.png"
+                                                            :skip-perms-check? true})))
+            (is (= #{} (existing file-id doc-id)))))))))
 
 (comment
   (test/run-tests *ns*))
