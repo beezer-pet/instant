@@ -1,6 +1,8 @@
 (ns instant.model.app-user-magic-code
   (:require
+   [instant.config :as config]
    [instant.jdbc.aurora :as aurora]
+   [instant.jdbc.sql :as sql]
    [instant.model.app :as app-model]
    [instant.model.app-user :as app-user-model]
    [instant.model.instant-user :as instant-user-model]
@@ -22,7 +24,17 @@
           ttl-ms (* 1000 60 (app-model/get-magic-code-expiry-minutes {:id app-id}))]
       (< (+ (.getTime created-at) ttl-ms) (System/currentTimeMillis)))))
 
+(defn- take-email-lock!
+  "Makes the transactions that create a code for the email take turns."
+  [tx-conn app-id email]
+  (sql/select ::take-email-lock!
+              tx-conn
+              ["select pg_advisory_xact_lock(?::int4, hashtext(?))"
+               (config/pg-lock-ns :magic-code)
+               (str app-id ":" email)]))
+
 (defn create!
+  "Creates a code for the email and deletes the email's earlier codes."
   ([params]
    (create! (aurora/conn-pool :write) params))
   ([conn {:keys [app-id email id code]}]
@@ -32,13 +44,17 @@
       conn
       {:app-id app-id
        :etype etype}
-      (fn [{:keys [transact! get-entity]}]
-        (transact! [{:id       id
-                     :etype    etype
-                     :codeHash (-> code
-                                   crypt-util/str->sha256
-                                   crypt-util/bytes->hex-string)
-                     :email    email}])
+      (fn [{:keys [tx-conn transact! get-entity get-entities-where]}]
+        (take-email-lock! tx-conn app-id email)
+        (transact! (conj (mapv (fn [{:keys [id]}]
+                                 [:delete-entity id etype])
+                               (get-entities-where {:email email}))
+                         {:id       id
+                          :etype    etype
+                          :codeHash (-> code
+                                        crypt-util/str->sha256
+                                        crypt-util/bytes->hex-string)
+                          :email    email}))
         (assoc (get-entity id)
                :code code))))))
 

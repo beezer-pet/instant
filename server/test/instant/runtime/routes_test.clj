@@ -133,7 +133,8 @@
    (with-empty-app
      (fn [{app-id :id :as app}]
        (testing "auth for new user"
-         (let [code  (send-code app {:email "a@b.c"})
+         (let [other (send-code app {:email "d@e.f"})
+               code  (send-code app {:email "a@b.c"})
                code2 (send-code app {:email "a@b.c"})]
 
            (testing "can generate two codes"
@@ -143,22 +144,22 @@
              (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "a@b.c" :code "000000"}))))
 
            (testing "can't use different email"
-             (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "wrong-email" :code code}))))
+             (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "wrong-email" :code code2}))))
+
+           (testing "can't use a code once a later one is generated"
+             (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "a@b.c" :code code}))))
 
            (testing "happy path"
-             (let [user (verify-code app {:email "a@b.c" :code code})]
+             (let [user (verify-code app {:email "a@b.c" :code code2})]
                (is (= (str app-id) (:app_id user)))
                (is (= "a@b.c" (:email user)))
                (is (some? (:refresh_token user)))))
 
            (testing "can't reuse code"
-             (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "a@b.c" :code code}))))
+             (is (thrown-with-msg? ExceptionInfo #"status 400" (verify-code app {:email "a@b.c" :code code2}))))
 
-           (testing "can use second unused code"
-             (let [user (verify-code app {:email "a@b.c" :code code2})]
-               (is (= (str app-id) (:app_id user)))
-               (is (= "a@b.c" (:email user)))
-               (is (some? (:refresh_token user)))))
+           (testing "can use the code of another email"
+             (is (= "d@e.f" (:email (verify-code app {:email "d@e.f" :code other})))))
 
            (testing "auth for existing user"
              (let [code3 (send-code app {:email "a@b.c"})

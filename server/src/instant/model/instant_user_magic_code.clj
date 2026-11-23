@@ -1,10 +1,12 @@
 (ns instant.model.instant-user-magic-code
   (:require
+   [instant.config :as config]
    [instant.jdbc.aurora :as aurora]
    [instant.jdbc.sql :as sql]
    [instant.model.instant-user :as instant-user-model]
    [instant.util.string :refer [rand-num-str]]
-   [instant.util.exception :as ex])
+   [instant.util.exception :as ex]
+   [next.jdbc :as next-jdbc])
   (:import
    (java.time Instant)
    (java.time.temporal ChronoUnit)
@@ -13,12 +15,27 @@
 (defn rand-code []
   (rand-num-str 6))
 
+(defn- take-user-lock!
+  "Makes the transactions that create a code for the user take turns."
+  [tx-conn user-id]
+  (sql/select ::take-user-lock!
+              tx-conn
+              ["SELECT pg_advisory_xact_lock(?::int4, hashtext(?))"
+               (config/pg-lock-ns :magic-code)
+               (str user-id)]))
+
 (defn create!
+  "Creates a code for the user and deletes the user's earlier codes."
   ([params] (create! (aurora/conn-pool :write) params))
   ([conn {:keys [id code user-id]}]
-   (sql/execute-one! conn
-                     ["INSERT INTO instant_user_magic_codes (id, code, user_id) VALUES (?::uuid, ?, ?::uuid)"
-                      id code user-id])))
+   (next-jdbc/with-transaction [tx-conn conn]
+     (take-user-lock! tx-conn user-id)
+     (sql/do-execute! tx-conn
+                      ["DELETE FROM instant_user_magic_codes WHERE user_id = ?::uuid"
+                       user-id])
+     (sql/execute-one! tx-conn
+                       ["INSERT INTO instant_user_magic_codes (id, code, user_id) VALUES (?::uuid, ?, ?::uuid)"
+                        id code user-id]))))
 
 (defn expired?
   ([magic-code] (expired? (Instant/now) magic-code))

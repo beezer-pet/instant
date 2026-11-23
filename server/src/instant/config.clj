@@ -493,7 +493,8 @@
   [k]
   (int (case k
          :webhook 1
-         :webhook-config 2)))
+         :webhook-config 2
+         :magic-code 3)))
 
 (defn init []
   ;; instantiate the config-map so we can fail early if it's not
