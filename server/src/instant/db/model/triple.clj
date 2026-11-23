@@ -1309,15 +1309,54 @@
 
     (sql/execute! ::delete-entity-multi! conn query)))
 
-;; n.b. if we ever use `:retract-triple` for blob attrs (it's currently
-;;      just links), we'll need to add code in `delete-multi!` to
-;;      insert nulls for indexed blob attrs
+(defn- insert-nulls-for-retracted!
+  "Gives a null triple to each entity that the deleted triples leave without
+   a triple of one of the app's indexed blob attributes, as `insert-multi!`
+   gives one to a new entity. The id attribute gets none."
+  [conn attrs app-id deleted]
+  (let [eid+attr-ids (distinct
+                      (for [{:keys [entity_id attr_id]} deleted
+                            :let [attr (attr-model/seek-by-id attr_id attrs)]
+                            :when (and (:index? attr)
+                                       (= :blob (:value-type attr))
+                                       (not= "id" (attr-model/fwd-label attr)))]
+                        [entity_id attr_id]))]
+    (when (seq eid+attr-ids)
+      (sql/do-execute!
+       ::insert-nulls-for-retracted!
+       conn
+       (sql/format
+        "insert into triples
+           (app_id, entity_id, attr_id, value, value_md5, ea, eav, av, ave, vae, checked_data_type)
+         select a.app_id, pairs.entity_id, a.id, cast('null' as jsonb), ?null-md5,
+                a.cardinality = 'one', false, a.is_unique, a.is_indexed, false, a.checked_data_type
+           from unnest(?eids, ?attr-ids) as pairs (entity_id, attr_id)
+           join attrs a
+             on a.id = pairs.attr_id
+            and a.app_id = ?app-id
+          where not exists (
+                  select 1
+                    from triples
+                   where triples.app_id = ?app-id
+                     and triples.entity_id = pairs.entity_id
+                     and triples.attr_id = pairs.attr_id
+                )
+          order by pairs.entity_id, pairs.attr_id
+         on conflict (app_id, entity_id, attr_id, value_md5) do nothing"
+        {"?app-id"   app-id
+         "?null-md5" json-null-md5
+         "?eids"     (with-meta (mapv first eid+attr-ids) {:pgtype "uuid[]"})
+         "?attr-ids" (with-meta (mapv second eid+attr-ids) {:pgtype "uuid[]"})})))))
+
 (defn delete-multi!
   "Deletes triples from postgres.
 
    We enhance given triples with their hashed values to assist postgres in
-   quickly finding which triples to delete"
-  [conn app-id triples]
+   quickly finding which triples to delete.
+
+   An entity that is left without a triple of one of the app's indexed blob
+   attributes gets a null triple for it."
+  [conn attrs app-id triples]
   (let [input-triples
         (mapv
          (fn [[e a v]]
@@ -1371,8 +1410,10 @@
          :delete-from :triples
          :using :locked-rows
          :where [:= :locked-rows.ctid :triples.ctid]
-         :returning [:triples.entity-id :triples.attr-id]}]
-    (sql/execute! ::delete-multi! conn (hsql/format query))))
+         :returning [:triples.entity-id :triples.attr-id]}
+        deleted (sql/execute! ::delete-multi! conn (hsql/format query))]
+    (insert-nulls-for-retracted! conn attrs app-id deleted)
+    deleted))
 
 ;; ---
 ;; fetch

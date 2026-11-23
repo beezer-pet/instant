@@ -1314,7 +1314,7 @@
                         (attr-model/get-by-app-id app-id)
                         app-id
                         [[:retract-triple [handle-attr-id "alex"] email-attr-id "a@example.com"]])
-          (is (= #{}
+          (is (= #{[alex-eid email-attr-id nil]}
                  (fetch-triples app-id [[:= :attr-id email-attr-id]
                                         [:= :entity-id alex-eid]]))))
 
@@ -5912,6 +5912,125 @@
           (is (= [{:count 1}]
                  (sql/select (aurora/conn-pool :read)
                              ["select count(*) from triples where app_id = ? and attr_id = ?" app-id old]))))))))
+
+;; A query ordered by an indexed attribute lists the entities that have a
+;; triple of it
+(deftest retract-leaves-indexed-attrs-their-nulls
+  (with-empty-app
+    (fn [{app-id :id}]
+      (let [attr->id  (test-util/make-attrs
+                       app-id
+                       [[:item/id :unique? :index?]
+                        [:item/rank :index? :number]
+                        [:item/code :unique? :index? :string]
+                        [:item/labels :many :index? :string]
+                        [:item/note]
+                        [:tag/id :unique? :index?]
+                        [[:item/tags :tag/items] :many]
+                        [:doc/id :unique? :index?]
+                        [:doc/title :required? :index? :string]])
+            item-id   (attr->id :item/id)
+            rank      (attr->id :item/rank)
+            code      (attr->id :item/code)
+            labels    (attr->id :item/labels)
+            note      (attr->id :item/note)
+            tags      (attr->id :item/tags)
+            title     (attr->id :doc/title)
+            [a b c d] (repeatedly random-uuid)
+            tag       (random-uuid)
+            doc       (random-uuid)
+            make-ctx  (fn [admin?]
+                        {:db               {:conn-pool (aurora/conn-pool :write)}
+                         :app-id           app-id
+                         :attrs            (attr-model/get-by-app-id app-id)
+                         :datalog-query-fn d/query
+                         :rules            (rule-model/get-by-app-id (aurora/conn-pool :read) {:app-id app-id})
+                         :current-user     nil
+                         :admin?           admin?})
+            transact! (fn transact!
+                        ([tx-steps]
+                         (transact! false tx-steps))
+                        ([admin? tx-steps]
+                         (permissioned-tx/transact! (make-ctx admin?) tx-steps)))
+            stored    (fn [eid aid]
+                        (into #{}
+                              (map (juxt (comp last :triple) :index))
+                              (triple-model/fetch (aurora/conn-pool :read)
+                                                  app-id
+                                                  [[:= :entity-id eid] [:= :attr-id aid]])))
+            by-rank   (fn []
+                        (let [ctx (make-ctx true)]
+                          (->> (iq/query ctx {:item {:$ {:order {:rank "asc"}}}})
+                               (instaql-nodes->object-tree ctx)
+                               (#(get % "item"))
+                               (map #(parse-uuid (get % "id"))))))]
+        (test-util/insert-entities
+         app-id attr->id
+         [{:db/id tag :tag/id tag}
+          {:db/id a :item/id a :item/rank 1 :item/code "a"}
+          {:db/id b :item/id b :item/rank 2 :item/code "b"}
+          {:db/id c :item/id c :item/rank 3 :item/code "c" :item/labels ["x" "y"]}
+          {:db/id d :item/id d :item/rank 4 :item/note "n" :item/tags tag}
+          {:db/id doc :doc/id doc :doc/title "t"}])
+        (is (= [a b c d] (by-rank)))
+        (testing "a retract of the value leaves a null triple"
+          (transact! [[:retract-triple b rank 2]])
+          (is (= #{[nil #{:ea :ave}]} (stored b rank)))
+          (is (= ["number"]
+                 (map :checked-data-type
+                      (triple-model/fetch (aurora/conn-pool :read)
+                                          app-id
+                                          [[:= :entity-id b] [:= :attr-id rank]]))))
+          (is (= [b a c d] (by-rank))))
+        (testing "a retract of the null triple leaves it"
+          (transact! [[:retract-triple b rank nil]])
+          (is (= #{[nil #{:ea :ave}]} (stored b rank)))
+          (is (= [b a c d] (by-rank))))
+        (testing "also under a rule that keeps the attribute as it is"
+          (rule-model/put! (aurora/conn-pool :write)
+                           {:app-id app-id
+                            :code   {:item {:allow {:update "newData.rank == data.rank"}}}})
+          (is (perm-pass? (transact! [[:retract-triple b rank nil]])))
+          (is (perm-err? (transact! [[:retract-triple a rank 1]])))
+          (rule-model/put! (aurora/conn-pool :write) {:app-id app-id :code {}})
+          (is (= #{[nil #{:ea :ave}]} (stored b rank)))
+          (is (= [b a c d] (by-rank))))
+        (testing "a retract that names another value than the one held changes nothing"
+          (transact! [[:retract-triple a rank 7]])
+          (is (= #{[1 #{:ea :ave}]} (stored a rank))))
+        (testing "a write of the attribute after its retract stores the value alone"
+          (transact! [[:retract-triple a rank 1]
+                      [:add-triple a rank 5]])
+          (is (= #{[5 #{:ea :ave}]} (stored a rank))))
+        (testing "a retract of the value that the transaction wrote leaves a null triple"
+          (transact! [[:add-triple a rank 6]
+                      [:retract-triple a rank 6]])
+          (is (= #{[nil #{:ea :ave}]} (stored a rank))))
+        (testing "through a lookup"
+          (transact! [[:retract-triple [code "c"] rank 3]])
+          (is (= #{[nil #{:ea :ave}]} (stored c rank))))
+        (testing "of an admin"
+          (transact! true [[:retract-triple d rank 4]])
+          (is (= #{[nil #{:ea :ave}]} (stored d rank))))
+        (is (= #{a b c d} (set (by-rank))))
+        (testing "a unique attribute takes a null triple on every entity"
+          (transact! [[:retract-triple a code "a"]
+                      [:retract-triple b code "b"]
+                      [:retract-triple [code "c"] code "c"]])
+          (is (= #{[nil #{:ea :av :ave}]} (stored a code) (stored b code) (stored c code))))
+        (testing "an attribute with many values takes one with its last value"
+          (transact! [[:retract-triple c labels "x"]])
+          (is (= #{["y" #{:ave}]} (stored c labels)))
+          (transact! [[:retract-triple c labels "y"]])
+          (is (= #{[nil #{:ave}]} (stored c labels))))
+        (testing "a required attribute is not retracted"
+          (is (validation-err? (transact! [[:retract-triple doc title "t"]])))
+          (is (= #{["t" #{:ea :ave}]} (stored doc title))))
+        (testing "an attribute that is not indexed, a link and the id take none"
+          (transact! [[:retract-triple d note "n"]
+                      [:retract-triple d tags tag]
+                      [:retract-triple d item-id d]])
+          (is (= #{} (stored d note) (stored d tags) (stored d item-id))))))))
 
 (deftest rules-see-entities-as-stored
   (with-empty-app

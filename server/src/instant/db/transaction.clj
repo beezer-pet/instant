@@ -614,7 +614,7 @@
                             (triple-model/deep-merge-multi! conn attrs app-id (map next tx-steps))
 
                             :retract-triple
-                            (triple-model/delete-multi! conn app-id (map next tx-steps))))))
+                            (triple-model/delete-multi! conn attrs app-id (map next tx-steps))))))
                {}
                grouped-tx-steps)
               eid+attr-ids (distinct
