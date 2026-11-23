@@ -2,6 +2,7 @@
   (:require [clojure.test :as test :refer [deftest testing is use-fixtures]]
             [instant.model.app-file :as app-file]
             [instant.storage.sweeper :as sweeper]
+            [instant.flags :as flags]
             [instant.jdbc.aurora :as aurora]
             [instant.jdbc.sql :as sql]
             [instant.fixtures :refer [with-empty-app]]
@@ -128,7 +129,7 @@
         ;; 100 files should be marked for sweep
         (is (= 100 (count-files-to-sweep conn app-id)))
 
-        (with-redefs [sweeper/storage-sweeper-grace-period-interval "0 days"]
+        (binding [flags/*flag-overrides* {:storage-sweeper-grace-period-days 0}]
           (sweeper/handle-sweep! conn {:app-id app-id
                                        :limit 1000}))
 
@@ -160,7 +161,7 @@
         ;; 250 files should be marked for sweep
         (is (= 250 (count-files-to-sweep conn app-id)))
 
-        (with-redefs [sweeper/storage-sweeper-grace-period-interval "0 days"]
+        (binding [flags/*flag-overrides* {:storage-sweeper-grace-period-days 0}]
           (sweeper/handle-sweep! conn {:app-id app-id
                                        :limit 100}))
 
@@ -189,7 +190,7 @@
         (is (= 5 (count-files-to-sweep conn app-id)))
 
         ;; Warn should be triggered
-        (is (:warn (with-redefs [sweeper/storage-sweeper-grace-period-interval "0 days"]
+        (is (:warn (binding [flags/*flag-overrides* {:storage-sweeper-grace-period-days 0}]
                      (sweeper/handle-sweep! conn {:app-id app-id
                                                   :limit 1
                                                   :max-loops 3}))))
@@ -198,13 +199,51 @@
         (is (= 2 (count-files-to-sweep conn app-id)))
 
         ;; Should be able to run again without issue
-        (with-redefs [sweeper/storage-sweeper-grace-period-interval "0 days"]
+        (binding [flags/*flag-overrides* {:storage-sweeper-grace-period-days 0}]
           (sweeper/handle-sweep! conn {:app-id app-id
                                        :limit 1
                                        :max-loops 2}))
 
         ;; All files should now be swept
         (is (= 0 (count-files-to-sweep conn app-id)))))))
+
+(deftest grace-period-is-the-flags-days
+  (with-empty-app
+    (fn [app]
+      (let [app-id (:id app)
+            conn (aurora/conn-pool :write)
+            sweep! (fn [days]
+                     (binding [flags/*flag-overrides* {:storage-sweeper-grace-period-days days}]
+                       (sweeper/handle-sweep! conn {:app-id app-id}))
+                     (count-files-to-sweep conn app-id))
+            file-ids (app-file/bulk-create!
+                      conn
+                      {:app-id app-id
+                       :data (for [location-id ["two-days-ago" "now"]]
+                               {:file-id (random-uuid)
+                                :path (str location-id ".jpg")
+                                :location-id location-id
+                                :metadata {:size 100
+                                           :content-type "image/jpeg"
+                                           :content-disposition "inline"}})})]
+        (app-file/delete-by-ids! conn {:app-id app-id :ids file-ids})
+        (sql/execute! ::backdate
+                      conn
+                      ["update app_files_to_sweep
+                           set created_at = now() - interval '2 days'
+                         where app_id = ?::uuid and location_id = 'two-days-ago'"
+                       app-id])
+
+        (testing "without a valid flag a file's object is kept for 32 days"
+          (binding [flags/*flag-overrides* {:storage-sweeper-grace-period-days nil}]
+            (is (= 32 (flags/storage-sweeper-grace-period-days))))
+          (is (= 2 (sweep! nil)))
+          (is (= 2 (sweep! -1))))
+
+        (testing "an object is deleted once its file has been gone for the flag's days"
+          (is (= 2 (sweep! 3)))
+          (is (= 1 (sweep! 1)))
+          (is (= 0 (sweep! 0))))))))
 
 (comment
   (test/run-tests *ns*))

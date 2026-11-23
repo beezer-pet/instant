@@ -150,6 +150,7 @@ To disable temporary app creation, open **Deployment Settings** and turn off **A
 Storage reads its settings from the `flags` of the Instant Config app. Open **Deployment Settings**, then **Advanced settings**, and add a row to `flags` with the setting's name as `setting` and a number as `value`. A change applies without a restart.
 
 - `storage-max-upload-bytes`: the largest upload that Storage accepts, in bytes. An upload that is larger, or that declares no `Content-Length`, is refused. Without the setting there is no limit. The server still receives the body of an upload that it refuses, so limit the size of a request's body in your reverse proxy as well.
+- `storage-sweeper-grace-period-days`: the days that Storage keeps a file's object in the bucket after the file is deleted or replaced, 32 without the setting. A URL of the file that was given out before works until then or until it expires. Keep the objects at least as long as the backups of your apps and of the database: downloading an app's backup fetches its files from the bucket, and a restored database brings back files that point at their objects.
 
 ### Configure the Instant CLI
 

@@ -651,6 +651,17 @@
     (when (pos-int? limit)
       limit)))
 
+(defn storage-sweeper-grace-period-days
+  "Days that the object of a deleted or replaced file is kept before the
+   storage sweeper deletes it, 32 unless the flag is a whole number of days.
+   This should be long enough for the backups to expire before we delete the
+   files."
+  []
+  (let [days (flag :storage-sweeper-grace-period-days)]
+    (if (nat-int? days)
+      days
+      32)))
+
 (defn magic-code-rate-limit-per-hour
   "Max number of magic code emails per email address per app per hour."
   []

@@ -31,13 +31,9 @@
    :end-at (str (Instant/now))
    :run-time-ms (ms-between start-ms (Instant/now))})
 
-;; This should be long enough for the backups to expire
-;; before we delete the files.
-(def storage-sweeper-grace-period-interval "32 days")
-
 (defn files-available-wheres []
   [:and
-   [:< :created-at [:- :%now [:interval [:inline storage-sweeper-grace-period-interval]]]]
+   [:< :created-at [:- :%now [:interval [:inline (str (flags/storage-sweeper-grace-period-days) " days")]]]]
    [:or
     [:is :process-id nil]
     [:and
