@@ -4,7 +4,9 @@ import { AttrsStore, AttrsStoreJson, Store, StoreJson } from './store.ts';
 export type QuerySubResult = {
   /**
    * The server's answer, without the pending mutations: `dataForQuery`
-   * applies those when it reads the result.
+   * applies those when it reads the result. A result read from storage for
+   * a query that is subscribed also holds the accepted transactions it had
+   * not processed.
    */
   store: Store;
   attrsStore: AttrsStore;

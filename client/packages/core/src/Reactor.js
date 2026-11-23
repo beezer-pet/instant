@@ -61,6 +61,7 @@ export const STATUS = {
 const QUERY_ONCE_TIMEOUT = 30_000;
 const PENDING_TX_CLEANUP_TIMEOUT = 30_000;
 const PENDING_MUTATION_CLEANUP_THRESHOLD = 200;
+const ACCEPTED_MUTATION_LIMIT = 200;
 const ONE_MIN_MS = 1_000 * 60;
 const ONE_DAY_MS = ONE_MIN_MS * 60 * 24;
 
@@ -195,15 +196,6 @@ function kvToStorage(key, x) {
   }
 }
 
-function onMergeQuerySub(_k, storageSub, inMemorySub) {
-  const storageResult = storageSub?.result;
-  const memoryResult = inMemorySub?.result;
-  if (storageResult && !memoryResult && inMemorySub) {
-    inMemorySub.result = storageResult;
-  }
-  return inMemorySub || storageSub;
-}
-
 function sortedMutationEntries(entries) {
   return [...entries].sort((a, b) => {
     const [ka, muta] = a;
@@ -304,6 +296,12 @@ export default class Reactor {
   _pendingTxCleanupTimeout;
   _pendingMutationCleanupThreshold;
   _inFlightMutationEventIds = new Set();
+  /**
+   * The last transactions the server accepted, by event id, in the order it
+   * accepted them. They outlive their time among the pending mutations, for
+   * the results that are read from storage later.
+   */
+  _acceptedMutations = new Map();
   /** @type FrameworkClient | null */
   _frameworkClient = null;
   /**
@@ -481,7 +479,7 @@ export default class Reactor {
   _initStorage(Storage) {
     this.querySubs = new PersistedObject({
       persister: new Storage(this.config.appId, 'querySubs'),
-      merge: onMergeQuerySub,
+      merge: this._onMergeQuerySub,
       serialize: querySubToStorage,
       parse: (_key, x) => querySubFromStorage(x, this.config.useDateObjects),
       // objectSize
@@ -576,6 +574,36 @@ export default class Reactor {
     this._errorMessage = err;
     this.notifyConnectionStatusSubs(status);
     this._instantStream.onConnectionStatusChange(status);
+  }
+
+  _onMergeQuerySub = (_k, storageSub, inMemorySub) => {
+    const storageResult = storageSub?.result;
+    const memoryResult = inMemorySub?.result;
+    if (storageResult && !memoryResult && inMemorySub) {
+      inMemorySub.result = this._withAcceptedMutations(storageResult);
+    }
+    return inMemorySub || storageSub;
+  };
+
+  /**
+   * `result` with the accepted transactions it has not processed applied to
+   * it, also those that are still pending, which `dataForQuery` applies
+   * again when it reads the result.
+   */
+  _withAcceptedMutations(result) {
+    const mutations = this._rewriteMutations(
+      result.attrsStore,
+      this._acceptedMutations,
+    );
+    return {
+      ...result,
+      ...this._applyOptimisticUpdates(
+        result.store,
+        result.attrsStore,
+        mutations,
+        result.processedTxId,
+      ),
+    };
   }
 
   _onMergeKv = (key, storageV, inMemoryV) => {
@@ -842,6 +870,14 @@ export default class Reactor {
             confirmed: Date.now(),
           });
         });
+        this._acceptedMutations.set(
+          eventId,
+          this._pendingMutations().get(eventId),
+        );
+        if (this._acceptedMutations.size > ACCEPTED_MUTATION_LIMIT) {
+          const [oldest] = this._acceptedMutations.keys();
+          this._acceptedMutations.delete(oldest);
+        }
 
         const newAttrs = [];
         for (const step of prevMutation['tx-steps']) {
@@ -2418,6 +2454,7 @@ export default class Reactor {
     this._dataForQueryCache = {};
     this._dataForQueryMemo = {};
     this._replayCache.clear();
+    this._acceptedMutations.clear();
     this.querySubs.updateInPlace((prev) => {
       Object.keys(prev).forEach((k) => {
         delete prev[k].result;

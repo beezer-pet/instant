@@ -579,9 +579,11 @@ async function reactorOnUsers(appId = uuid()) {
   await waitForLoaded(reactor);
   await reactor.querySubs.waitForKeyToLoad(weakHash(usersQ));
   const seen = [];
-  reactor.subscribeQuery(usersQ, (res) => seen.push(res.data.users));
+  const close = reactor.subscribeQuery(usersQ, (res) =>
+    seen.push(res.data.users),
+  );
   await waitForLoaded(reactor);
-  return { reactor, seen };
+  return { reactor, seen, close };
 }
 
 async function answerUsers(reactor, triples, processedTxId) {
@@ -767,4 +769,164 @@ test('an accepted transaction is delivered once', async () => {
     ['mine', 'alex', 'stopa', 'nicolegf', 'new'],
   ]);
   expect(reactor._pendingMutations().size).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// A query subscribed again after the server accepted a transaction
+
+const booksQ = { books: {} };
+
+async function accept(reactor, eventId, txId) {
+  reactor._handleReceive(0, {
+    op: 'transact-ok',
+    'client-event-id': eventId,
+    'tx-id': txId,
+  });
+  await waitForLoaded(reactor);
+}
+
+/**
+ * The answer of another open query. With it every open query has processed
+ * the transactions up to `processedTxId`, and the reactor drops them.
+ */
+async function answerBooks(reactor, processedTxId) {
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q: booksQ,
+    'processed-tx-id': processedTxId,
+    result: usersResult(zenecaTriples),
+  });
+  await waitForLoaded(reactor);
+}
+
+/** Every answer `usersQ` gives a new subscriber before the server answers. */
+async function reopenUsers(reactor) {
+  const seen = [];
+  reactor.subscribeQuery(usersQ, (res) => seen.push(res.data.users));
+  await reactor.querySubs.waitForKeyToLoad(weakHash(usersQ));
+  await waitForLoaded(reactor);
+  return seen;
+}
+
+test('a query closed before the answer that holds an accepted transaction has it when opened again', async () => {
+  const { reactor, close } = await reactorOnUsers();
+  reactor.subscribeQuery(booksQ, () => {});
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor.pushTx(instatx.tx.users[joeId].update({ handle: 'mine' }));
+  await waitForLoaded(reactor);
+  const [eventId] = pendingEventIds(reactor);
+
+  close();
+  await accept(reactor, eventId, 3);
+  await answerBooks(reactor, 3);
+  expect(reactor._pendingMutations().size).toBe(0);
+
+  const seen = await reopenUsers(reactor);
+  expect(seen.map((users) => joeOf(users).handle)).toEqual(['mine']);
+});
+
+test('a closed query has the transactions accepted since, in their order, when opened again', async () => {
+  const { reactor, close } = await reactorOnUsers();
+  reactor.subscribeQuery(booksQ, () => {});
+  await answerUsers(reactor, zenecaTriples, 1);
+  close();
+
+  const newId = uuid();
+  const sends = [
+    instatx.tx.users[joeId].update({ handle: 'first' }),
+    instatx.tx.users[newId].update({ handle: 'new' }),
+    instatx.tx.users[joeId].update({ handle: 'second' }),
+  ];
+  for (const [i, chunk] of sends.entries()) {
+    reactor.pushTx(chunk);
+    await waitForLoaded(reactor);
+    await accept(reactor, pendingEventIds(reactor).at(-1), 3 + i);
+  }
+  await answerBooks(reactor, 5);
+  expect(reactor._pendingMutations().size).toBe(0);
+
+  const seen = await reopenUsers(reactor);
+  expect(seen.map(handlesOf)).toEqual([
+    ['second', 'alex', 'stopa', 'nicolegf', 'new'],
+  ]);
+
+  // the server's answer takes their place
+  await answerUsers(reactor, triplesWithJoeAs('theirs'), 6);
+  expect(handlesOf(seen.at(-1))).toEqual([
+    'theirs',
+    'alex',
+    'stopa',
+    'nicolegf',
+  ]);
+});
+
+test('a query opened again keeps an answer that has processed the accepted transaction', async () => {
+  const { reactor, close } = await reactorOnUsers();
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor.pushTx(instatx.tx.users[joeId].update({ handle: 'mine' }));
+  await waitForLoaded(reactor);
+  const [eventId] = pendingEventIds(reactor);
+  await accept(reactor, eventId, 3);
+
+  // another writer changed the record after ours was stored
+  await refreshUsers(reactor, triplesWithJoeAs('theirs'), 4);
+  expect(reactor._pendingMutations().size).toBe(0);
+  close();
+
+  const seen = await reopenUsers(reactor);
+  expect(seen.map((users) => joeOf(users).handle)).toEqual(['theirs']);
+});
+
+test('a query opened again while the accepted transaction is pending shows it once', async () => {
+  const { reactor, close } = await reactorOnUsers();
+  reactor.subscribeQuery(booksQ, () => {});
+  await answerUsers(reactor, zenecaTriples, 1);
+  close();
+
+  const newId = uuid();
+  const idAttrId = '5a4f5a6d-ba83-4bf0-ae78-27a863300224';
+  reactor.pushTx(instatx.tx.users[newId].update({ handle: 'new' }));
+  await waitForLoaded(reactor);
+  await accept(reactor, pendingEventIds(reactor)[0], 3);
+  expect(reactor._pendingMutations().size).toBe(1);
+
+  const seen = await reopenUsers(reactor);
+  await answerUsers(
+    reactor,
+    [
+      ...zenecaTriples,
+      [newId, idAttrId, newId, Date.now()],
+      [newId, handleAttrId, 'new', Date.now()],
+    ],
+    3,
+  );
+
+  expect(seen.map(handlesOf)).toEqual([
+    ['joe', 'alex', 'stopa', 'nicolegf', 'new'],
+  ]);
+  expect(reactor._pendingMutations().size).toBe(0);
+});
+
+test('a query opened again by another user has nothing of the transactions accepted before', async () => {
+  const { reactor, close } = await reactorOnUsers();
+  reactor.subscribeQuery(booksQ, () => {});
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor.pushTx(instatx.tx.users[joeId].update({ handle: 'mine' }));
+  await waitForLoaded(reactor);
+  const [eventId] = pendingEventIds(reactor);
+  await accept(reactor, eventId, 3);
+
+  reactor._transport = { close() {} };
+  await reactor.updateUser({ id: uuid() });
+
+  // the next user's answer, from before the server processed the transaction
+  await answerUsers(reactor, zenecaTriples, 2);
+  close();
+  await answerBooks(reactor, 3);
+
+  const seen = await reopenUsers(reactor);
+  expect(seen.map((users) => joeOf(users).handle)).toEqual(['joe']);
 });
