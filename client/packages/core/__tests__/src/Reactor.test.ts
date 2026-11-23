@@ -547,3 +547,224 @@ test('getLocalId always returns the same id', async () => {
 
   expect(id).toStrictEqual([...ids][0]);
 });
+
+// ---------------------------------------------------------------------------
+// A transaction the server refuses
+
+const joeId = 'ce942051-2d74-404a-9c7d-4aa3f2d54ae4';
+const handleAttrId = '6a089759-2a2f-4898-9bb8-a7bc9f6f791a';
+const usersQ = { users: {} };
+
+function usersResult(triples) {
+  return [
+    {
+      data: { 'datalog-result': { 'join-rows': [triples] } },
+      'child-nodes': [],
+    },
+  ];
+}
+
+/** zeneca's triples once another writer has given joe the handle `handle`. */
+function triplesWithJoeAs(handle) {
+  return zenecaTriples.map((t) =>
+    t[0] === joeId && t[1] === handleAttrId ? [t[0], t[1], handle, t[3]] : t,
+  );
+}
+
+/** A reactor subscribed to `usersQ`, and every answer its subscriber got. */
+async function reactorOnUsers(appId = uuid()) {
+  const reactor = new Reactor({ appId });
+  reactor._initStorage(IndexedDBStorage);
+  reactor._setAttrs(zenecaAttrs);
+  await waitForLoaded(reactor);
+  await reactor.querySubs.waitForKeyToLoad(weakHash(usersQ));
+  const seen = [];
+  reactor.subscribeQuery(usersQ, (res) => seen.push(res.data.users));
+  await waitForLoaded(reactor);
+  return { reactor, seen };
+}
+
+async function answerUsers(reactor, triples, processedTxId) {
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q: usersQ,
+    'processed-tx-id': processedTxId,
+    result: usersResult(triples),
+  });
+  await waitForLoaded(reactor);
+}
+
+async function refreshUsers(reactor, triples, processedTxId) {
+  reactor._handleReceive(0, {
+    op: 'refresh-ok',
+    'processed-tx-id': processedTxId,
+    attrs: zenecaAttrs,
+    computations: [
+      { 'instaql-query': usersQ, 'instaql-result': usersResult(triples) },
+    ],
+  });
+  await waitForLoaded(reactor);
+}
+
+/** The pending transactions' event ids, in the order they were made. */
+function pendingEventIds(reactor) {
+  return [...reactor._pendingMutations().entries()]
+    .sort(([, a], [, b]) => a.order - b.order)
+    .map(([eventId]) => eventId);
+}
+
+async function refuse(reactor, eventId) {
+  // The transaction's promise resolved as `enqueued`, so the reactor logs
+  // the refusal for want of a listener.
+  const error = console.error;
+  console.error = () => {};
+  try {
+    reactor._handleReceive(0, {
+      op: 'error',
+      status: 400,
+      type: 'permission-denied',
+      message: 'Permission denied: not perms-pass?',
+      'client-event-id': eventId,
+    });
+  } finally {
+    console.error = error;
+  }
+  await waitForLoaded(reactor);
+}
+
+const joeOf = (users) => users.find((user) => user.id === joeId);
+const handlesOf = (users) => users.map((user) => user.handle);
+
+test('a refused transaction leaves nothing in an answer that arrived while it was pending', async () => {
+  const { reactor, seen } = await reactorOnUsers();
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor.pushTx(instatx.tx.users[joeId].update({ handle: 'mine' }));
+  await waitForLoaded(reactor);
+  const [eventId] = pendingEventIds(reactor);
+
+  // another writer changes the same record before the server refuses ours
+  await refreshUsers(reactor, triplesWithJoeAs('theirs'), 2);
+  await refuse(reactor, eventId);
+
+  expect(seen.map((users) => joeOf(users).handle)).toEqual([
+    'joe',
+    'mine',
+    'theirs',
+  ]);
+  expect(reactor._pendingMutations().size).toBe(0);
+});
+
+test('a transaction refused after a reload leaves nothing in the answer read back from storage', async () => {
+  const appId = uuid();
+  const { reactor } = await reactorOnUsers(appId);
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor.pushTx(instatx.tx.users[joeId].update({ handle: 'mine' }));
+  await waitForLoaded(reactor);
+  const [eventId] = pendingEventIds(reactor);
+  await refreshUsers(reactor, triplesWithJoeAs('theirs'), 2);
+
+  // a second reactor reads the answer and the pending transaction back
+  const { reactor: reloaded, seen } = await reactorOnUsers(appId);
+  expect(pendingEventIds(reloaded)).toEqual([eventId]);
+  expect(joeOf(seen.at(-1)).handle).toEqual('mine');
+
+  await refuse(reloaded, eventId);
+
+  expect(joeOf(seen.at(-1)).handle).toEqual('theirs');
+});
+
+test('of two pending transactions on one record, a refusal takes back the refused one alone', async () => {
+  const { reactor, seen } = await reactorOnUsers();
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor.pushTx(
+    instatx.tx.users[joeId].update({ handle: 'first', fullName: 'First' }),
+  );
+  reactor.pushTx(instatx.tx.users[joeId].update({ handle: 'second' }));
+  await waitForLoaded(reactor);
+  const [first, second] = pendingEventIds(reactor);
+
+  await refreshUsers(reactor, zenecaTriples, 2);
+  await refuse(reactor, first);
+
+  expect(joeOf(seen.at(-1))).toMatchObject({
+    handle: 'second',
+    fullName: 'Joe Averbukh',
+  });
+  expect(pendingEventIds(reactor)).toEqual([second]);
+});
+
+test('a create the server refused is not sent as an update afterwards', async () => {
+  const { reactor, seen } = await reactorOnUsers();
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  const newId = uuid();
+  const create = () =>
+    reactor.pushTx(instatx.tx.users[newId].update({ handle: 'new' }));
+
+  create();
+  await waitForLoaded(reactor);
+  const [firstSend] = pendingEventIds(reactor);
+  expect(handlesOf(seen.at(-1))).toContain('new');
+
+  // an answer arrives while the create is on its way
+  await refreshUsers(reactor, triplesWithJoeAs('theirs'), 2);
+  await refuse(reactor, firstSend);
+
+  expect(handlesOf(seen.at(-1))).toEqual([
+    'theirs',
+    'alex',
+    'stopa',
+    'nicolegf',
+  ]);
+
+  create();
+  await waitForLoaded(reactor);
+  const [secondSend] = pendingEventIds(reactor);
+  const secondSteps = reactor._pendingMutations().get(secondSend)['tx-steps'];
+
+  expect(secondSteps.map((step) => step[4]?.mode)).not.toContain('update');
+});
+
+test('an accepted transaction is delivered once', async () => {
+  const { reactor, seen } = await reactorOnUsers();
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  const newId = uuid();
+  const idAttrId = '5a4f5a6d-ba83-4bf0-ae78-27a863300224';
+  const createdAt = Date.now();
+  reactor.pushTx([
+    instatx.tx.users[joeId].update({ handle: 'mine' }),
+    instatx.tx.users[newId].update({ handle: 'new' }),
+  ]);
+  await waitForLoaded(reactor);
+  const [eventId] = pendingEventIds(reactor);
+
+  // an answer from before the transaction, with nothing changed
+  await refreshUsers(reactor, zenecaTriples, 2);
+
+  reactor._handleReceive(0, {
+    op: 'transact-ok',
+    'client-event-id': eventId,
+    'tx-id': 3,
+  });
+  await waitForLoaded(reactor);
+
+  await refreshUsers(
+    reactor,
+    [
+      ...triplesWithJoeAs('mine'),
+      [newId, idAttrId, newId, createdAt],
+      [newId, handleAttrId, 'new', createdAt],
+    ],
+    3,
+  );
+
+  expect(seen.map(handlesOf)).toEqual([
+    ['joe', 'alex', 'stopa', 'nicolegf'],
+    ['mine', 'alex', 'stopa', 'nicolegf', 'new'],
+  ]);
+  expect(reactor._pendingMutations().size).toBe(0);
+});

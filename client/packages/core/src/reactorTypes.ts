@@ -2,6 +2,10 @@ import { PageInfoResponse } from './queryTypes.ts';
 import { AttrsStore, AttrsStoreJson, Store, StoreJson } from './store.ts';
 
 export type QuerySubResult = {
+  /**
+   * The server's answer, without the pending mutations: `dataForQuery`
+   * applies those when it reads the result.
+   */
   store: Store;
   attrsStore: AttrsStore;
   pageInfo?: PageInfoResponse<any> | null | undefined;

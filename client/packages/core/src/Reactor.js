@@ -778,8 +778,6 @@ export default class Reactor {
           });
         }
 
-        const mutations = sortedMutationEntries(rewrittenMutations.entries());
-
         const updates = computations.map((x) => {
           const q = x['instaql-query'];
           const result = x['instaql-result'];
@@ -792,23 +790,9 @@ export default class Reactor {
             enableCardinalityInference,
             this.config.useDateObjects,
           );
-          const { store: newStore, attrsStore: newAttrsStore } =
-            this._applyOptimisticUpdates(
-              store,
-              attrsStore,
-              mutations,
-              processedTxId,
-            );
           const pageInfo = result?.[0]?.data?.['page-info'];
           const aggregate = result?.[0]?.data?.['aggregate'];
-          return {
-            q,
-            hash,
-            store: newStore,
-            attrsStore: newAttrsStore,
-            pageInfo,
-            aggregate,
-          };
+          return { q, hash, store, attrsStore, pageInfo, aggregate };
         });
 
         updates.forEach(
