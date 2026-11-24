@@ -441,10 +441,11 @@
 
 (defn- recompute-instaql-query!
   [{:keys [store current-user app-id sess-id attrs table-info admin?]}
-   {:keys [instaql-query/query instaql-query/return-type
+   {:keys [db/id instaql-query/query instaql-query/return-type
            instaql-query/forms-hash]}]
   (let [ctx {:db {:conn-pool (aurora/conn-pool (db-read-level app-id))}
              :skip-unchanged-result? true
+             :instaql-query-eid id
              :session-id sess-id
              :app-id app-id
              :attrs attrs
@@ -464,6 +465,19 @@
      :result-changed? result-changed?
      :duration-ms (- end-ms start-ms)
      :instaql-topic? instaql-topic?}))
+
+(defn- held-results
+  "The results of recomputing the stale queries, without those of the queries
+   that the session no longer holds."
+  [store app-id sess-id stale-queries results]
+  (let [db @(rs/app-conn store app-id)]
+    (keep (fn [[stale-query result]]
+            (when (rs/instaql-query-held? db
+                                          sess-id
+                                          (:instaql-query/query stale-query)
+                                          (:db/id stale-query))
+              result))
+          (map vector stale-queries results))))
 
 (defn- handle-refresh! [store sess-id event debug-info]
   (e2e-tracer/invalidator-tracking-step! {:tx-id (:tx-id event)
@@ -489,7 +503,8 @@
                               :processed-isn processed-isn
                               :instaql-queries (map :instaql-query/query stale-queries)})
         recompute-results (->> stale-queries
-                               (ua/pmap (partial recompute-instaql-query! opts)))
+                               (ua/pmap (partial recompute-instaql-query! opts))
+                               (held-results store app-id sess-id stale-queries))
         {computations true spam false} (group-by :result-changed? recompute-results)
         num-spam (count spam)
         num-computations (count computations)

@@ -618,30 +618,64 @@
         report     (transact! "store/bump-instaql-version!" conn tx)]
     (d/entity (:db-after report) lookup-ref)))
 
-(defn set-instaql-topic! [store app-id instaql-query-eid topic]
+(defn instaql-query-held?
+  "Whether the db holds the session's instaql query `q` with the eid. A query
+   that is removed and added again gets a new eid. The eid names a query only
+   together with its session and `q`: once the last session of an app has
+   left, the app gets a new conn, which numbers its entities from the start."
+  [db sess-id q eid]
+  (and (some? eid)
+       (= [sess-id q] (:v (d/find-datom db :eavt eid :instaql-query/session-id+query)))))
+
+(defn bump-existing-instaql-version!
+  "Bumps the version of the session's instaql query `q` with the eid and marks
+   it as not stale. Returns nil if the store no longer holds the query."
+  [store app-id sess-id q eid]
+  (let [conn   (app-conn store app-id)
+        tx     [[:db.fn/call
+                 (fn [db]
+                   (when (instaql-query-held? db sess-id q eid)
+                     [{:db/id eid
+                       :instaql-query/version (inc (:instaql-query/version (d/entity db eid)))
+                       :instaql-query/stale? false}]))]]
+        report (transact! "store/bump-instaql-version!" conn tx)]
+    (when (instaql-query-held? (:db-after report) sess-id q eid)
+      (d/entity (:db-after report) eid))))
+
+(defn set-instaql-topic! [store app-id sess-id q instaql-query-eid topic]
   (let [conn (app-conn store app-id)]
     (transact! "store/set-instaql-topic!"
                conn
-               [[:db/add instaql-query-eid :instaql-query/topic topic]])))
+               [[:db.fn/call
+                 (fn [db]
+                   (when (instaql-query-held? db sess-id q instaql-query-eid)
+                     [[:db/add instaql-query-eid :instaql-query/topic topic]]))]])))
 
 ;; ----
 ;; remove instaql queries
 
 (defn- remove-subscriptions-tx-data
   "Should be used in a db.fn/call. Returns transactions.
-   Retracts the instaql-query and subscriptions for the query."
-  [db session-id instaql-query]
-  (if-some [query-eid (d/entid db [:instaql-query/session-id+query [session-id instaql-query]])]
-    (concat
-     (for [datom (d/datoms db :avet :subscription/instaql-query query-eid)]
-       [:db/retractEntity (:e datom)])
-     [[:db/retractEntity query-eid]])
-    []))
+   Retracts the instaql-query and subscriptions for the query. With an eid,
+   only if the query has that eid."
+  [db session-id instaql-query eid]
+  (let [query-eid (d/entid db [:instaql-query/session-id+query [session-id instaql-query]])]
+    (if (and query-eid (or (nil? eid) (= eid query-eid)))
+      (concat
+       (for [datom (d/datoms db :avet :subscription/instaql-query query-eid)]
+         [:db/retractEntity (:e datom)])
+       [[:db/retractEntity query-eid]])
+      [])))
 
-(defn remove-query! [store app-id sess-id q]
-  (transact! "store/remove-query!"
-             (app-conn store app-id)
-             [[:db.fn/call remove-subscriptions-tx-data sess-id q]]))
+(defn remove-query!
+  "Removes the session's instaql query. With an eid, only if the store holds
+   the query under that eid."
+  ([store app-id sess-id q]
+   (remove-query! store app-id sess-id q nil))
+  ([store app-id sess-id q eid]
+   (transact! "store/remove-query!"
+              (app-conn store app-id)
+              [[:db.fn/call remove-subscriptions-tx-data sess-id q eid]])))
 
 ;; --------------
 ;; adding queries
@@ -649,8 +683,8 @@
 (defn- clean-stale-subscriptions-tx-data
   "Should be used in a db.fn/call. Returns transactions.
    Retracts subscriptions for an older version of an instaql query."
-  [db instaql-query-lookup-ref version]
-  (if-some [query-eid (d/entid db instaql-query-lookup-ref)]
+  [db session-id instaql-query query-eid version]
+  (if (instaql-query-held? db session-id instaql-query query-eid)
     (keep (fn [datom]
             (let [sub-version (:v (d/find-datom db :eavt (:e datom) :subscription/v))]
               (when (or (not sub-version)
@@ -662,20 +696,22 @@
 (defn- set-instaql-query-result-tx-data
   "Should be used in a db.fn/call. Returns transactions.
    Sets the hash for the query result."
-  [db lookup-ref result-hash]
-  (if-some [e (d/entid db lookup-ref)]
-    [[:db/add e :instaql-query/hash result-hash]]
+  [db session-id instaql-query query-eid result-hash]
+  (if (instaql-query-held? db session-id instaql-query query-eid)
+    [[:db/add query-eid :instaql-query/hash result-hash]]
     []))
 
-(defn add-instaql-query! [store {:keys [app-id session-id instaql-query v] :as _ctx} result-hash]
+(defn add-instaql-query!
+  "Records the result of version `v` of the session's instaql query with the
+   eid. Records nothing for a query the store no longer holds."
+  [store {:keys [app-id session-id instaql-query instaql-query-eid v] :as _ctx} result-hash]
   (let [conn            (app-conn store app-id)
-        lookup-ref      [:instaql-query/session-id+query [session-id instaql-query]]
         report          (transact! "store/add-instaql-query!"
                                    conn
-                                   [[:db.fn/call clean-stale-subscriptions-tx-data lookup-ref v]
-                                    [:db.fn/call set-instaql-query-result-tx-data lookup-ref result-hash]])
-        hash-before     (:instaql-query/hash (d/entity (:db-before report) lookup-ref))
-        hash-after      (:instaql-query/hash (d/entity (:db-after report) lookup-ref))
+                                   [[:db.fn/call clean-stale-subscriptions-tx-data session-id instaql-query instaql-query-eid v]
+                                    [:db.fn/call set-instaql-query-result-tx-data session-id instaql-query instaql-query-eid result-hash]])
+        hash-before     (:instaql-query/hash (d/entity (:db-before report) instaql-query-eid))
+        hash-after      (:instaql-query/hash (d/entity (:db-after report) instaql-query-eid))
         result-changed? (or (not= hash-before hash-after)
                             (and (nil? hash-before)
                                  (nil? hash-after)))]
@@ -909,30 +945,34 @@
 ;; -------------
 ;; subscriptions
 
-(defn record-datalog-query-start! [store ctx datalog-query coarse-topics]
-  (let [{:keys [app-id session-id instaql-query v]} ctx
+(defn record-datalog-query-start!
+  "Subscribes the instaql query of the ctx to the datalog query, which it
+   creates if needed. Records nothing for an instaql query the store no
+   longer holds."
+  [store ctx datalog-query coarse-topics]
+  (let [{:keys [app-id session-id instaql-query instaql-query-eid v]} ctx
         conn (app-conn store app-id)]
     (transact! "store/record-datalog-query-start!"
                conn
                [[:db.fn/call
                  (fn [db]
-                   (let [lookup-ref [:datalog-query/app-id+query [app-id datalog-query]]
-                         existing-datalog-query (d/entity db lookup-ref)
-                         datalog-query-eid (or (:db/id existing-datalog-query) -1)]
-                     (concat
-                      (if existing-datalog-query
-                        (when-not (:datalog-query/topics existing-datalog-query)
+                   (when (instaql-query-held? db session-id instaql-query instaql-query-eid)
+                     (let [lookup-ref [:datalog-query/app-id+query [app-id datalog-query]]
+                           existing-datalog-query (d/entity db lookup-ref)
+                           datalog-query-eid (or (:db/id existing-datalog-query) -1)]
+                       (concat
+                        (if existing-datalog-query
+                          (when-not (:datalog-query/topics existing-datalog-query)
+                            [{:db/id datalog-query-eid
+                              :datalog-query/topics coarse-topics}])
                           [{:db/id datalog-query-eid
+                            :datalog-query/app-id app-id
+                            :datalog-query/query  datalog-query
                             :datalog-query/topics coarse-topics}])
-                        [{:db/id datalog-query-eid
-                          :datalog-query/app-id app-id
-                          :datalog-query/query  datalog-query
-                          :datalog-query/topics coarse-topics}])
-                      (when-some [query-eid (d/entid db [:instaql-query/session-id+query [session-id instaql-query]])]
                         [{:subscription/app-id app-id
                           :subscription/session-id session-id
                           :subscription/v v
-                          :subscription/instaql-query query-eid
+                          :subscription/instaql-query instaql-query-eid
                           :subscription/datalog-query datalog-query-eid}]))))]])))
 
 (defn- topic-links
@@ -950,7 +990,7 @@
                                     datalog-query
                                     {:keys [topics] :as _result}]
 
-  (let [{:keys [app-id]} ctx
+  (let [{:keys [app-id session-id instaql-query instaql-query-eid]} ctx
         conn (app-conn store app-id)
         lookup-ref [:datalog-query/app-id+query [app-id datalog-query]]
         links (topic-links topics)]
@@ -959,10 +999,11 @@
      conn
      [[:db.fn/call
        (fn [db]
-         (when-some [existing (d/entity db lookup-ref)]
-           (cond-> [[:db/add (:db/id existing) :datalog-query/topics topics]]
-             (seq links)
-             (conj [:db/add (:db/id existing) :datalog-query/topic-links links]))))]])))
+         (when (instaql-query-held? db session-id instaql-query instaql-query-eid)
+           (when-some [existing (d/entity db lookup-ref)]
+             (cond-> [[:db/add (:db/id existing) :datalog-query/topics topics]]
+               (seq links)
+               (conj [:db/add (:db/id existing) :datalog-query/topic-links links])))))]])))
 
 ;; ------------
 ;; invalidation

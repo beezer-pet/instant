@@ -839,6 +839,197 @@
                         (resolvers/walk-friendly r)
                         pretty-subs)))))))))
 
+(defn- hold-first-call
+  "Wraps `f` so that its first call delivers `held` and waits for `release`:
+   `:before` it runs `f`, `:after` it has run it, or to `:throw` in place of
+   running it."
+  [f mode held release]
+  (let [first-call? (atom true)
+        hold (fn []
+               (deliver held true)
+               @release)]
+    (fn [& args]
+      (if-not (compare-and-set! first-call? true false)
+        (apply f args)
+        (case mode
+          :before (do (hold) (apply f args))
+          :after (let [ret (apply f args)]
+                   (hold)
+                   ret)
+          :throw (do (hold) (throw (ex-info "Run failed" {}))))))))
+
+(defn- run-beside
+  "Calls `run` on another thread, holds it at its first call of the function
+   in the var `v` (`mode` as in `hold-first-call`) and calls `f` meanwhile.
+   Returns when `run` is through, and throws what it threw."
+  [v mode run f]
+  (let [held (promise)
+        release (promise)]
+    (with-redefs-fn {v (hold-first-call @v mode held release)}
+      (fn []
+        (let [running (future (run))]
+          (try
+            (is (deref held 5000 false) "The run reaches the held call")
+            (f)
+            (finally
+              (deliver release true)))
+          (let [ret (deref running 5000 ::timeout)]
+            (is (not= ::timeout ret) "The run ends")))))))
+
+(defn- refresh-beside
+  "Runs a refresh of the socket's session beside `f`, as `run-beside`."
+  [store socket v mode f]
+  (run-beside v
+              mode
+              #(#'session/handle-refresh! store (:id socket) {:op :refresh} (atom {}))
+              f))
+
+(defn- with-stale-query
+  "Calls `f` with a session that holds query-1987, marked stale."
+  [f]
+  (with-session
+    (fn [store {:keys [socket movies-app-id movies-resolver]}]
+      (blocking-send-msg :init-ok socket {:op :init
+                                          :app-id movies-app-id
+                                          :versions {session/core-version-key "0.20.5"}})
+      (blocking-send-msg :add-query-ok socket {:op :add-query
+                                               :q (:kw-q query-1987)})
+      (rs/mark-stale-topics! store
+                             movies-app-id
+                             0
+                             (instant.isn/test-isn 0)
+                             [(d/pat->coarse-topic
+                               [:ea (resolvers/->uuid movies-resolver "eid-robocop")])]
+                             {})
+      (is (seq (rs/get-stale-instaql-queries store movies-app-id (:id socket))))
+      (f store socket movies-app-id movies-resolver))))
+
+(defn- query-datoms
+  "What the store holds for the app's queries: every datom of its instaql
+   queries, subscriptions and datalog queries, with a hash in place of a
+   compiled topic."
+  [store app-id]
+  (->> (ds/datoms @(rs/app-conn store app-id) :eavt)
+       (remove #(= "tx-meta" (namespace (:a %))))
+       (map (fn [{:keys [e a v]}]
+              [e a (if (= :instaql-query/topic a) (hash v) v)]))
+       set))
+
+(deftest refresh-leaves-out-a-query-removed-since-it-was-found-stale
+  (with-stale-query
+    (fn [store socket app-id _r]
+      (let [q (:kw-q query-1987)]
+        (refresh-beside store socket #'rs/get-stale-instaql-queries :after
+                        #(blocking-send-msg :remove-query-ok socket {:op :remove-query :q q}))
+        (is (empty? (rs/session-instaql-queries store app-id (:id socket))))
+        (is (empty? (query-datoms store app-id)))
+        (is (nil? (a/poll! (:ws-conn socket))) "No computation is sent for the removed query")
+        (is (some? (:result (blocking-send-msg :add-query-ok socket {:op :add-query :q q}))))))))
+
+(deftest refresh-leaves-nothing-of-a-query-removed-while-it-runs
+  (with-stale-query
+    (fn [store socket app-id _r]
+      (let [q (:kw-q query-1987)]
+        (refresh-beside store socket #'iq/permissioned-query :before
+                        #(blocking-send-msg :remove-query-ok socket {:op :remove-query :q q}))
+        (is (empty? (query-datoms store app-id)))
+        (is (nil? (a/poll! (:ws-conn socket))) "No computation is sent for the removed query")
+        (is (some? (:result (blocking-send-msg :add-query-ok socket {:op :add-query :q q}))))))))
+
+(defn- remove-write-and-add!
+  "Removes query-1987 from the session, transacts `tx-steps` and adds the
+   query again. Returns the result of the add."
+  [socket app-id tx-steps]
+  (let [q (:kw-q query-1987)]
+    (blocking-send-msg :remove-query-ok socket {:op :remove-query :q q})
+    (tx/transact! (aurora/conn-pool :write)
+                  (attr-model/get-by-app-id app-id)
+                  app-id
+                  tx-steps)
+    (:result (blocking-send-msg :add-query-ok socket {:op :add-query :q q}))))
+
+(defn- robocop-title-step [r title]
+  [:add-triple
+   (resolvers/->uuid r "eid-robocop")
+   (resolvers/->uuid r :movie/title)
+   title])
+
+(deftest refresh-leaves-a-query-added-again-while-it-runs-as-the-add-made-it
+  (with-stale-query
+    (fn [store socket app-id r]
+      (let [title "RoboCop 2"
+            after-add (atom nil)]
+        (refresh-beside store socket #'iq/permissioned-query :after
+                        (fn []
+                          (let [result (remove-write-and-add! socket app-id [(robocop-title-step r title)])]
+                            (is (some #(= title (nth % 2))
+                                      (-> result first :data :datalog-result :join-rows first))))
+                          (reset! after-add (query-datoms store app-id))))
+        (is (seq (get-subscriptions-for-app-id store app-id)))
+        (is (= @after-add (query-datoms store app-id)))
+        (is (nil? (a/poll! (:ws-conn socket))) "The result from before the add is not sent")))))
+
+(deftest refresh-sends-no-result-from-before-a-query-was-added-again
+  (with-stale-query
+    (fn [store socket app-id r]
+      (tx/transact! (aurora/conn-pool :write)
+                    (attr-model/get-by-app-id app-id)
+                    app-id
+                    [(robocop-title-step r "RoboCop 2")])
+      (refresh-beside store socket #'rq/collect-instaql-results-for-client :before
+                      #(remove-write-and-add! socket app-id [(robocop-title-step r "RoboCop 3")]))
+      (is (nil? (a/poll! (:ws-conn socket))) "The result from before the add is not sent"))))
+
+(deftest refresh-leaves-the-topics-of-a-query-added-again-while-it-runs
+  (with-stale-query
+    (fn [store socket app-id r]
+      (let [movie (random-uuid)
+            title-attr (resolvers/->uuid r :movie/title)
+            after-add (atom nil)]
+        (refresh-beside store socket #'rs/record-datalog-query-finish! :before
+                        (fn []
+                          (remove-write-and-add! socket app-id
+                                                 [[:add-triple movie (resolvers/->uuid r :movie/id) (str movie)]
+                                                  [:add-triple movie (resolvers/->uuid r :movie/year) 1987]])
+                          (reset! after-add (query-datoms store app-id))))
+        (is (= @after-add (query-datoms store app-id)))
+        (rs/mark-stale-topics! store
+                               app-id
+                               0
+                               (instant.isn/test-isn 0)
+                               [[#{:ea} #{movie} #{title-attr} #{"Wall Street"}]]
+                               {})
+        (is (seq (rs/get-stale-instaql-queries store app-id (:id socket)))
+            "A write to the movie that the add found marks the query stale")))))
+
+(deftest failed-refresh-leaves-a-query-added-again-while-it-runs
+  (with-stale-query
+    (fn [store socket app-id r]
+      (let [after-add (atom nil)]
+        (is (thrown-with-msg?
+             Exception #"Run failed"
+             (refresh-beside store socket #'iq/permissioned-query :throw
+                             (fn []
+                               (remove-write-and-add! socket app-id [(robocop-title-step r "RoboCop 2")])
+                               (reset! after-add (query-datoms store app-id))))))
+        (is (seq (get-subscriptions-for-app-id store app-id)))
+        (is (= @after-add (query-datoms store app-id)))))))
+
+(deftest failed-add-query-leaves-a-query-added-again-while-it-runs
+  (with-stale-query
+    (fn [store socket app-id r]
+      (let [q (:kw-q query-1987)
+            after-add (atom nil)]
+        (blocking-send-msg :remove-query-ok socket {:op :remove-query :q q})
+        (run-beside #'iq/permissioned-query :throw
+                    #(send-msg socket {:op :add-query :q q})
+                    (fn []
+                      (remove-write-and-add! socket app-id [(robocop-title-step r "RoboCop 2")])
+                      (reset! after-add (query-datoms store app-id))))
+        (is (= :error (:op (read-msg socket))))
+        (is (seq (get-subscriptions-for-app-id store app-id)))
+        (is (= @after-add (query-datoms store app-id)))))))
+
 (deftest refresh-throttles-when-flag-enabled
   (with-session
     (fn [_store {:keys [socket movies-app-id]}]

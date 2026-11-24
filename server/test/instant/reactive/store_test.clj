@@ -39,13 +39,21 @@
         make-res (fn [v]
                    (with-meta v {:sql-byte-len 10}))
         record-start (fn [store app-id dq]
-                       (rs/record-datalog-query-start! store
-                                                       {:app-id app-id
-                                                        :session-id (random-uuid)
-                                                        :instaql-query {:q {:$ {:where {:v (str (random-uuid))}}}}
-                                                        :v 0}
-                                                       dq
-                                                       #{}))]
+                       (let [session-id (random-uuid)
+                             instaql-query {:q {:$ {:where {:v (str (random-uuid))}}}}
+                             iq-ent (rs/bump-instaql-version! store
+                                                              app-id
+                                                              session-id
+                                                              instaql-query
+                                                              :join-rows)]
+                         (rs/record-datalog-query-start! store
+                                                         {:app-id app-id
+                                                          :session-id session-id
+                                                          :instaql-query instaql-query
+                                                          :instaql-query-eid (:db/id iq-ent)
+                                                          :v (:instaql-query/version iq-ent)}
+                                                         dq
+                                                         #{})))]
     (testing "store returns cached data"
       (let [q [[:ea (random-uuid)]]]
         (record-start store app-id q)
@@ -177,6 +185,63 @@
                                                    (make-res {:ok :ok}))
                                                  nil
                                                  q)))))))
+
+(deftest a-removed-instaql-query-takes-no-writes
+  (let [store (rs/init)
+        app-id (random-uuid)
+        sess-id (random-uuid)
+        q {:users {}}
+        dq [[:ea (random-uuid)]]
+        datoms #(set (map (juxt :e :a :v) (d/datoms @(rs/app-conn store app-id) :eavt)))
+        add! (fn [sess-id q]
+               (let [iq-ent (rs/bump-instaql-version! store app-id sess-id q :join-rows)]
+                 {:app-id app-id
+                  :session-id sess-id
+                  :instaql-query q
+                  :instaql-query-eid (:db/id iq-ent)
+                  :v (:instaql-query/version iq-ent)}))
+        recorded-hash (fn [{:keys [instaql-query-eid]}]
+                        (:instaql-query/hash (d/entity @(rs/app-conn store app-id) instaql-query-eid)))
+        bump! (fn [{:keys [session-id instaql-query instaql-query-eid]}]
+                (rs/bump-existing-instaql-version! store app-id session-id instaql-query instaql-query-eid))
+        write! (fn [{:keys [session-id instaql-query instaql-query-eid] :as ctx}]
+                 (rs/set-instaql-topic! store app-id session-id instaql-query instaql-query-eid {:program :removed})
+                 (rs/record-datalog-query-start! store ctx dq #{})
+                 (rs/record-datalog-query-finish! store ctx dq {:topics '[[:ea _ _ _]]})
+                 (rs/add-instaql-query! store ctx 1)
+                 (rs/remove-query! store app-id session-id instaql-query instaql-query-eid))
+        ctx (add! sess-id q)]
+    (rs/remove-query! store app-id sess-id q)
+    (testing "once it is removed"
+      (let [before (datoms)]
+        (is (nil? (bump! ctx)))
+        (write! ctx)
+        (is (= before (datoms)))))
+    (testing "once it is added again"
+      (let [new-ctx (add! sess-id q)
+            _ (rs/record-datalog-query-start! store new-ctx dq #{})
+            _ (rs/record-datalog-query-finish! store new-ctx dq {:topics '[[:ea #{1} _ _]]})
+            _ (rs/add-instaql-query! store new-ctx 2)
+            before (datoms)]
+        (is (= 2 (recorded-hash new-ctx)))
+        (is (not= (:instaql-query-eid ctx) (:instaql-query-eid new-ctx)))
+        (is (nil? (bump! ctx)))
+        (write! ctx)
+        (is (= before (datoms)))
+        (is (= 2 (:instaql-query/version (bump! new-ctx))))))
+    (doseq [[label other-sess-id] [["another session's query" (random-uuid)]
+                                   ["another query of the session" sess-id]]]
+      (testing (str "once " label " has its eid in a new conn")
+        (.remove ^java.util.Map (:conns store) app-id)
+        (let [other-ctx (add! other-sess-id {:posts {}})
+              ctx (assoc ctx :instaql-query-eid (:instaql-query-eid other-ctx))
+              _ (rs/record-datalog-query-start! store other-ctx dq #{})
+              _ (rs/add-instaql-query! store other-ctx 2)
+              before (datoms)]
+          (is (= 2 (recorded-hash other-ctx)))
+          (is (nil? (bump! ctx)))
+          (write! ctx)
+          (is (= before (datoms))))))))
 
 (defmacro is-match-topic-part [iv-part dq-part expected]
   `(is (= ~expected (#'rs/match-topic-part? ~iv-part ~dq-part))

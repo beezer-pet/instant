@@ -167,52 +167,63 @@
 (defn instaql-query-reactive!
   "Returns the result of an instaql query while producing book-keeping side
   effects in the store. Refreshes with :skip-unchanged-result? can omit unchanged
-  payloads and metadata for an explicitly enabled app/query cohort."
-  [store {:keys [session-id app-id attrs skip-unchanged-result?] :as base-ctx} instaql-query return-type inference?]
+  payloads and metadata for an explicitly enabled app/query cohort.
+
+  With :instaql-query-eid, runs the query for the session's instaql query with
+  that eid and returns nil if the store does not hold it when the run starts.
+  The store keeps nothing of a run whose instaql query is removed meanwhile."
+  [store {:keys [session-id app-id attrs skip-unchanged-result? instaql-query-eid] :as base-ctx} instaql-query return-type inference?]
   (tracer/with-span! {:name "instaql-query-reactive!"
                       :attributes {:session-id session-id
                                    :app-id app-id
                                    :instaql-query instaql-query}}
-    (try
-      (let [iq-ent (rs/bump-instaql-version! store app-id session-id instaql-query return-type)
-            v (:instaql-query/version iq-ent)
-            iq-topic (or (:instaql-query/topic iq-ent)
-                         (when-let [topic (compile-instaql-topic attrs instaql-query)]
-                           (rs/set-instaql-topic! store app-id (:db/id iq-ent) topic)
-                           topic))
+    (let [iq-eid (volatile! instaql-query-eid)]
+      (try
+        (when-some [iq-ent (if instaql-query-eid
+                             (rs/bump-existing-instaql-version! store app-id session-id instaql-query instaql-query-eid)
+                             (rs/bump-instaql-version! store app-id session-id instaql-query return-type))]
+          (vreset! iq-eid (:db/id iq-ent))
+          (let [v (:instaql-query/version iq-ent)
+                iq-topic (or (:instaql-query/topic iq-ent)
+                             (when-let [topic (compile-instaql-topic attrs instaql-query)]
+                               (rs/set-instaql-topic! store app-id session-id instaql-query (:db/id iq-ent) topic)
+                               topic))
 
-            _ (tracer/add-data! {:attributes {:v v
-                                              :iq-topic? (boolean iq-topic)}})
-            ctx (-> base-ctx
-                    (assoc :v v
-                           :datalog-query-fn (partial datalog-query-reactive! store)
-                           :instaql-query instaql-query)
-                    ((fn [ctx]
-                       (-> ctx
-                           (assoc :record-datalog-query-start! (partial rs/record-datalog-query-start! store ctx)
-                                  :record-datalog-query-finish! (partial rs/record-datalog-query-finish! store ctx))))))
+                _ (tracer/add-data! {:attributes {:v v
+                                                  :iq-topic? (boolean iq-topic)}})
+                ctx (-> base-ctx
+                        (assoc :v v
+                               :instaql-query-eid (:db/id iq-ent)
+                               :datalog-query-fn (partial datalog-query-reactive! store)
+                               :instaql-query instaql-query)
+                        ((fn [ctx]
+                           (-> ctx
+                               (assoc :record-datalog-query-start! (partial rs/record-datalog-query-start! store ctx)
+                                      :record-datalog-query-finish! (partial rs/record-datalog-query-finish! store ctx))))))
 
-            instaql-result (iq/permissioned-query ctx instaql-query)
-            result-hash (hash {:instaql-result instaql-result
-                               :attrs (attr-model/unwrap attrs)})
-            {:keys [result-changed?]} (rs/add-instaql-query! store ctx result-hash)
-            materialize? (or result-changed?
-                             (not skip-unchanged-result?)
-                             (not (skip-unchanged-result-enabled? app-id instaql-query)))]
-        {:instaql-result (when materialize?
-                           (case return-type
-                             :join-rows (if (transient-triple-collection-enabled? app-id instaql-query)
-                                          (collect-instaql-results-with-transients instaql-result)
-                                          (collect-instaql-results-for-client instaql-result))
-                             :tree (instaql-nodes->object-tree (assoc ctx :inference? inference?) instaql-result)
-                             (collect-instaql-results-for-client instaql-result)))
-         :result-meta (when (and materialize? (= :tree return-type))
-                        (instaql-nodes->object-meta instaql-result))
-         :result-changed? result-changed?
-         :instaql-topic? (boolean iq-topic)})
-      (catch Throwable e
-        (rs/remove-query! store app-id session-id instaql-query)
-        (throw e)))))
+                instaql-result (iq/permissioned-query ctx instaql-query)
+                result-hash (hash {:instaql-result instaql-result
+                                   :attrs (attr-model/unwrap attrs)})
+                {:keys [result-changed?]} (rs/add-instaql-query! store ctx result-hash)
+                materialize? (or result-changed?
+                                 (not skip-unchanged-result?)
+                                 (not (skip-unchanged-result-enabled? app-id instaql-query)))]
+            {:instaql-result (when materialize?
+                               (case return-type
+                                 :join-rows (if (transient-triple-collection-enabled? app-id instaql-query)
+                                              (collect-instaql-results-with-transients instaql-result)
+                                              (collect-instaql-results-for-client instaql-result))
+                                 :tree (instaql-nodes->object-tree (assoc ctx :inference? inference?) instaql-result)
+                                 (collect-instaql-results-for-client instaql-result)))
+             :result-meta (when (and materialize? (= :tree return-type))
+                            (instaql-nodes->object-meta instaql-result))
+             :result-changed? result-changed?
+             :instaql-topic? (boolean iq-topic)}))
+        (catch Throwable e
+          ;; Without an eid the version bump has not returned: the query is
+          ;; removed whatever its eid.
+          (rs/remove-query! store app-id session-id instaql-query @iq-eid)
+          (throw e))))))
 
 (comment
   (def z (c/zeneca-app!))

@@ -164,6 +164,17 @@
                            (rq/instaql-query-reactive! store ctx query :tree true)))
       (is (empty? (rs/session-instaql-queries store (:app-id ctx) (:session-id ctx)))))))
 
+(deftest failed-version-bump-still-removes-the-query
+  (let [{:keys [ctx query]} (query-fixture)
+        store (rs/init)
+        bump rs/bump-instaql-version!]
+    (with-redefs [rs/bump-instaql-version! (fn [& args]
+                                             (apply bump args)
+                                             (throw (ex-info "Bump interrupted" {})))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Bump interrupted"
+                           (rq/instaql-query-reactive! store ctx query :tree true)))
+      (is (empty? (rs/session-instaql-queries store (:app-id ctx) (:session-id ctx)))))))
+
 (deftest repeated-refresh-token-lookups-return-the-user
   (with-empty-app
     (fn [{app-id :id}]
