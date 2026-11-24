@@ -2,13 +2,14 @@ let devBackend = false;
 let instantLogs = false;
 let devtoolLocalDashboard = false;
 
-if (
-  typeof window !== 'undefined' &&
-  typeof window.localStorage !== 'undefined'
-) {
-  devBackend = !!window.localStorage.getItem('devBackend');
-  instantLogs = !!window.localStorage.getItem('__instantLogging');
-  devtoolLocalDashboard = !!window.localStorage.getItem('__devtoolLocalDash');
+try {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    devBackend = !!window.localStorage.getItem('devBackend');
+    instantLogs = !!window.localStorage.getItem('__instantLogging');
+    devtoolLocalDashboard = !!window.localStorage.getItem('__devtoolLocalDash');
+  }
+} catch {
+  // The browser refuses localStorage, as with site data blocked
 }
 
 export { devBackend, instantLogs, devtoolLocalDashboard };

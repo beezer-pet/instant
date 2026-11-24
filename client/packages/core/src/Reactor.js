@@ -361,8 +361,12 @@ export default class Reactor {
     }
 
     if (typeof BroadcastChannel === 'function') {
-      this._broadcastChannel = new BroadcastChannel('@instantdb');
-      this._broadcastChannel.addEventListener('message', async (e) => {
+      try {
+        this._broadcastChannel = new BroadcastChannel('@instantdb');
+      } catch {
+        // Firefox refuses it with cookies and site data blocked
+      }
+      this._broadcastChannel?.addEventListener('message', async (e) => {
         try {
           if (e.data?.type === 'auth') {
             const res = await this.getCurrentUser({

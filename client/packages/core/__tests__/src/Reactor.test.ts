@@ -1134,6 +1134,28 @@ function exists(reactor, { 'client-event-id': eventId }) {
 
 const opsOf = (sent) => sent.map((msg) => msg.op);
 
+test('a reactor starts when the browser refuses a BroadcastChannel', () => {
+  vi.stubGlobal(
+    'BroadcastChannel',
+    class {
+      constructor() {
+        throw new DOMException('denied', 'SecurityError');
+      }
+    },
+  );
+  // The channel is opened in a browser alone
+  vi.stubGlobal('window', globalThis);
+  try {
+    const reactor = new Reactor({ appId: uuid() }, IndexedDBStorage, {
+      // Never answers, so no socket is opened
+      getIsOnline: () => new Promise(() => {}),
+    });
+    expect(reactor._broadcastChannel).toBeUndefined();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
 test('the user changes when storage is blocked', async () => {
   const blocked = () => Promise.reject(new Error('storage is blocked'));
   class BlockedStorage {
