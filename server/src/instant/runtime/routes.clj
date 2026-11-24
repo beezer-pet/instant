@@ -518,9 +518,6 @@
                          (throw (ex-info msg (merge {:type :oauth-error :message msg}
                                                     (apply hash-map params)))))
 
-          _ (when (:error params)
-              (return-error (:error params)))
-
           state-param (or (:state params)
                           (return-error "Missing state param in OAuth redirect."))
 
@@ -544,12 +541,15 @@
                                                                  :state  state})
                              (return-error "Could not find OAuth request."))
 
-          _ (when (app-oauth-redirect-model/expired? oauth-redirect)
-              (return-error "The request is expired."))
-
           _ (when-not (crypt-util/constant-bytes= (crypt-util/uuid->sha256 cookie)
                                                   (:cookie-hash-bytes oauth-redirect))
               (return-error "Mismatch in OAuth request cookie."))
+
+          _ (when (app-oauth-redirect-model/expired? oauth-redirect)
+              (return-error "The request is expired." :oauth-redirect oauth-redirect))
+
+          _ (when (:error params)
+              (return-error (:error params) :oauth-redirect oauth-redirect))
 
           auth-code (or (:code params)
                         (return-error "Missing code param in OAuth redirect."))

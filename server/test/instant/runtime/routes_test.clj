@@ -20,6 +20,7 @@
    [instant.model.app-email-template :as app-email-template-model]
    [instant.model.app-email-verification :as app-email-verification]
    [instant.model.app-oauth-client :as app-oauth-client-model]
+   [instant.model.app-oauth-redirect :as app-oauth-redirect-model]
    [instant.model.app-oauth-service-provider :as provider-model]
    [instant.model.app-user :as app-user-model]
    [instant.model.app-user-refresh-token :as refresh-token-model]
@@ -1091,3 +1092,114 @@
         (is (string/starts-with? cookie "__session=instantdb_"))
         (is (string/includes? cookie "; Secure"))
         (is (string/includes? cookie "; SameSite=None"))))))
+
+(defn- start-oauth
+  "Starts an OAuth request that returns to https://example.com/cb?next=home.
+   Returns the state param and the cookie that the callback needs."
+  [app]
+  (app-authorized-redirect-origin-model/add!
+   {:app-id (:id app)
+    :service "generic"
+    :params ["example.com"]})
+  (let [provider (provider-model/create! {:app-id (:id app)
+                                          :provider-name "github"})
+        _ (app-oauth-client-model/create! {:app-id (:id app)
+                                           :provider-id (:id provider)
+                                           :client-name "github"
+                                           :client-id "client-id"
+                                           :client-secret "client-secret"})
+        resp ((core/handler)
+              {:request-method :get
+               :uri "/runtime/oauth/start"
+               :query-string (str "app_id=" (:id app)
+                                  "&client_name=github"
+                                  "&redirect_uri=https%3A%2F%2Fexample.com%2Fcb%3Fnext%3Dhome")
+               :headers {}})]
+    {:state (second (re-find #"[?&]state=([^&]+)" (get-in resp [:headers "Location"])))
+     :cookie (first (string/split (first (get-in resp [:headers "Set-Cookie"])) #";"))}))
+
+(defn- oauth-callback-with
+  "Calls the OAuth callback with the query string, as a form post if post? is set."
+  [{:keys [query cookie post?]}]
+  (with-redefs [tracer/*silence-exceptions?* (atom true)]
+    ((core/handler)
+     (merge {:uri "/runtime/oauth/callback"
+             :headers (cond-> {}
+                        cookie (assoc "cookie" cookie)
+                        post? (assoc "content-type" "application/x-www-form-urlencoded"))}
+            (if post?
+              {:request-method :post
+               :body (ByteArrayInputStream. (.getBytes ^String query "UTF-8"))}
+              {:request-method :get
+               :query-string query})))))
+
+(deftest oauth-callback-returns-provider-errors-to-the-app
+  (doseq [post? [false true]]
+    (testing (if post? "form post" "query")
+      (with-empty-app
+        (fn [app]
+          (let [{:keys [state cookie]} (start-oauth app)
+                callback {:query (str "error=access_denied&state=" state)
+                          :cookie cookie
+                          :post? post?}
+                resp (oauth-callback-with callback)]
+            (is (= 302 (:status resp)))
+            (is (= "https://example.com/cb?next=home&error=access_denied&_instant_oauth_redirect=true"
+                   (get-in resp [:headers "Location"])))
+            (testing "once"
+              (is (= 400 (:status (oauth-callback-with callback)))))))))))
+
+(deftest oauth-callback-returns-an-expired-request-to-the-app
+  (with-empty-app
+    (fn [app]
+      (let [{:keys [state cookie]} (start-oauth app)
+            resp (with-redefs [app-oauth-redirect-model/expired? (constantly true)]
+                   (oauth-callback-with {:query (str "code=code&state=" state)
+                                         :cookie cookie}))]
+        (is (= 302 (:status resp)))
+        (is (= "https://example.com/cb?next=home&error=The+request+is+expired.&_instant_oauth_redirect=true"
+               (get-in resp [:headers "Location"])))))))
+
+(deftest oauth-callback-returns-the-error-and-not-the-code
+  (with-empty-app
+    (fn [app]
+      (let [{:keys [state cookie]} (start-oauth app)
+            resp (oauth-callback-with {:query (str "error=access_denied&code=code&state=" state)
+                                       :cookie cookie})]
+        (is (= 302 (:status resp)))
+        (is (= "https://example.com/cb?next=home&error=access_denied&_instant_oauth_redirect=true"
+               (get-in resp [:headers "Location"])))))))
+
+(deftest oauth-callback-does-not-redirect-a-request-it-cannot-match
+  (with-empty-app
+    (fn [app]
+      (let [{:keys [state cookie]} (start-oauth app)
+            rejection (fn [opts]
+                        (let [resp (oauth-callback-with opts)]
+                          (is (= 400 (:status resp)))
+                          (is (nil? (get-in resp [:headers "Location"])))
+                          (get (<-json (:body resp)) "error")))]
+        (testing "no state"
+          (is (= "Missing state param in OAuth redirect."
+                 (rejection {:query "error=access_denied" :cookie cookie}))))
+        (testing "unknown state"
+          (is (= "Could not find OAuth request."
+                 (rejection {:query (str "error=access_denied&state=" (:id app) (random-uuid))
+                             :cookie cookie}))))
+        (testing "no cookie"
+          (is (= "Missing cookie."
+                 (rejection {:query (str "error=access_denied&state=" state)}))))
+        (testing "another browser's cookie"
+          (is (= "Mismatch in OAuth request cookie."
+                 (rejection {:query (str "error=access_denied&state=" state)
+                             :cookie (str "__session=instantdb_" (random-uuid))}))))))))
+
+(deftest oauth-callback-does-not-redirect-an-expired-request-of-another-browser
+  (with-empty-app
+    (fn [app]
+      (let [{:keys [state]} (start-oauth app)
+            resp (with-redefs [app-oauth-redirect-model/expired? (constantly true)]
+                   (oauth-callback-with {:query (str "code=code&state=" state)
+                                         :cookie (str "__session=instantdb_" (random-uuid))}))]
+        (is (= 400 (:status resp)))
+        (is (nil? (get-in resp [:headers "Location"])))))))
