@@ -150,6 +150,9 @@ function querySubFromStorage(x, useDateObjects) {
       v.result.attrsStore = attrsStore;
     }
   }
+  if (v?.result) {
+    v.result.fromStorage = true;
+  }
 
   return v;
 }
@@ -711,7 +714,22 @@ export default class Reactor {
         break;
       }
       case 'add-query-exists': {
-        this.notifyOneQueryOnce(weakHash(msg.q));
+        const hash = weakHash(msg.q);
+        const result = this.querySubs.currentValue[hash]?.result;
+        if (result && !result.fromStorage) {
+          this.notifyOneQueryOnce(hash);
+          break;
+        }
+        const once = this.queryOnceDfds[hash]?.find(
+          (r) => r.eventId === msg['client-event-id'],
+        );
+        if (once) {
+          // The server holds the query and this client holds no answer of
+          // the server to it, so the query is removed there and asked anew.
+          once.eventId = uuid();
+          this._trySendAuthed(uuid(), { op: 'remove-query', q: msg.q });
+          this._trySendAuthed(once.eventId, { op: 'add-query', q: msg.q });
+        }
         break;
       }
       case 'add-query-ok': {
@@ -1259,10 +1277,10 @@ export default class Reactor {
     this.queryOnceDfds[hash] = this.queryOnceDfds[hash] ?? [];
     this.queryOnceDfds[hash].push({ q, dfd, eventId });
 
-    setTimeout(
-      () => dfd.reject(new Error('Query timed out')),
-      QUERY_ONCE_TIMEOUT,
-    );
+    setTimeout(() => {
+      dfd.reject(new Error('Query timed out'));
+      this._completeQueryOnce(q, hash, dfd);
+    }, QUERY_ONCE_TIMEOUT);
 
     return dfd.promise;
   }

@@ -1,6 +1,6 @@
 // https://www.npmjs.com/package/fake-indexeddb
 import 'fake-indexeddb/auto';
-import { test, expect } from 'vitest';
+import { test, expect, vi } from 'vitest';
 import { setTimeout as sleep } from 'timers/promises';
 
 import IndexedDBStorage from '../../src/IndexedDBStorage';
@@ -989,4 +989,166 @@ test('a query left as its answer arrives is gone from storage once the user chan
   reactor.updateUser({ id: uuid() });
 
   expect(await storedUsers(reactor, appId)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// queryOnce when the server answers that it holds the query
+
+/** A reactor the server has let in, and every message it sends. */
+async function connectedReactor(appId = uuid()) {
+  const reactor = new Reactor({ appId });
+  reactor._initStorage(IndexedDBStorage);
+  reactor._setAttrs(zenecaAttrs);
+  await waitForLoaded(reactor);
+  const sent = [];
+  reactor._transport = {
+    isOpen: () => true,
+    send: (msg) => sent.push(msg),
+    close() {},
+  };
+  reactor.status = 'authenticated';
+  return { reactor, sent };
+}
+
+function exists(reactor, { 'client-event-id': eventId }) {
+  reactor._handleReceive(0, {
+    op: 'add-query-exists',
+    q: usersQ,
+    'client-event-id': eventId,
+  });
+}
+
+const opsOf = (sent) => sent.map((msg) => msg.op);
+
+test('queryOnce asks anew when the server holds the query without having answered it', async () => {
+  const { reactor, sent } = await connectedReactor();
+  const once = reactor.queryOnce(usersQ);
+  expect(opsOf(sent)).toEqual(['add-query']);
+
+  exists(reactor, sent[0]);
+  expect(opsOf(sent)).toEqual(['add-query', 'remove-query', 'add-query']);
+
+  exists(reactor, sent[2]);
+  expect(opsOf(sent.slice(3))).toEqual(['remove-query', 'add-query']);
+
+  receiveUsers(reactor, 1);
+  expect(handlesOf((await once).data.users)).toEqual([
+    'joe',
+    'alex',
+    'stopa',
+    'nicolegf',
+  ]);
+});
+
+test('queryOnce rejects with the error the server answers when it is asked anew', async () => {
+  const { reactor, sent } = await connectedReactor();
+  const once = reactor.queryOnce(usersQ);
+  exists(reactor, sent[0]);
+
+  reactor._handleReceive(0, {
+    op: 'error',
+    status: 500,
+    message: 'The query failed.',
+    'client-event-id': sent[2]['client-event-id'],
+    'original-event': sent[2],
+  });
+  await expect(once).rejects.toEqual({ message: 'The query failed.' });
+});
+
+test('queryOnce asks nothing more once it has timed out', async () => {
+  const { reactor, sent } = await connectedReactor();
+  vi.useFakeTimers({ toFake: ['setTimeout'] });
+  const once = reactor.queryOnce(usersQ);
+  vi.advanceTimersByTime(30_000);
+  vi.useRealTimers();
+  await expect(once).rejects.toThrow('Query timed out');
+  expect(opsOf(sent)).toEqual(['add-query', 'remove-query']);
+
+  exists(reactor, sent[0]);
+  expect(sent.length).toBe(2);
+});
+
+test('the timeout of an answered queryOnce leaves the query to those that hold it', async () => {
+  const { reactor, sent } = await connectedReactor();
+  const seen = [];
+  vi.useFakeTimers({ toFake: ['setTimeout'] });
+  try {
+    const first = reactor.queryOnce(usersQ);
+    receiveUsers(reactor, 1);
+    await first;
+
+    vi.advanceTimersByTime(20_000);
+    reactor.subscribeQuery(usersQ, (res) => seen.push(res.data.users));
+    receiveUsers(reactor, 2);
+    const second = reactor.queryOnce(usersQ);
+    const asked = sent.length;
+
+    vi.advanceTimersByTime(10_000);
+    expect(sent.length).toBe(asked);
+    expect(seen.length).toBe(1);
+
+    exists(reactor, sent.at(-1));
+    expect(handlesOf((await second).data.users)).toEqual(handlesOf(seen[0]));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('queryOnce does not resolve with a stored answer when the server holds the query', async () => {
+  const appId = uuid();
+  const { reactor: earlier, close } = await reactorOnUsers(appId);
+  await answerUsers(earlier, zenecaTriples, 1);
+  close();
+
+  const { reactor, sent } = await connectedReactor(appId);
+  const once = reactor.queryOnce(usersQ);
+  await reactor.querySubs.waitForKeyToLoad(weakHash(usersQ));
+
+  exists(reactor, sent[0]);
+  expect(opsOf(sent)).toEqual(['add-query', 'remove-query', 'add-query']);
+
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q: usersQ,
+    'processed-tx-id': 2,
+    result: usersResult(triplesWithJoeAs('theirs')),
+  });
+  expect(joeOf((await once).data.users).handle).toEqual('theirs');
+});
+
+test('queryOnce is not resolved by the answer to an earlier ask that the query is held', async () => {
+  const { reactor, sent } = await connectedReactor();
+  const first = reactor.queryOnce(usersQ);
+  const second = reactor.queryOnce(usersQ);
+  receiveUsers(reactor, 1);
+  await Promise.all([first, second]);
+
+  const third = reactor.queryOnce(usersQ);
+  const asked = sent.length;
+  exists(reactor, sent[1]);
+  expect(sent.length).toBe(asked);
+
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q: usersQ,
+    'processed-tx-id': 2,
+    result: usersResult([]),
+  });
+  expect((await third).data).toEqual({ users: [] });
+});
+
+test('queryOnce beside a subscription resolves with its answer and asks nothing more', async () => {
+  const { reactor, sent } = await connectedReactor();
+  const seen = [];
+  reactor.subscribeQuery(usersQ, (res) => seen.push(res.data.users));
+  receiveUsers(reactor, 1);
+  expect(seen.length).toBe(1);
+
+  const once = reactor.queryOnce(usersQ);
+  expect(opsOf(sent)).toEqual(['add-query', 'add-query']);
+  exists(reactor, sent[1]);
+
+  expect(handlesOf((await once).data.users)).toEqual(handlesOf(seen[0]));
+  expect(sent.length).toBe(2);
+  expect(seen.length).toBe(1);
 });

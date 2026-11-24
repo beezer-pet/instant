@@ -14,6 +14,8 @@ export type QuerySubResult = {
   aggregate?: any;
   processedTxId?: number;
   isExternal?: boolean;
+  /** The result was read from storage, not received from the server. */
+  fromStorage?: boolean;
 };
 
 export type QuerySub = {

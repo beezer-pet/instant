@@ -896,7 +896,8 @@ class InstantCoreDatabase<
 
   /**
    * Use this for one-off queries.
-   * Returns local data if available, otherwise fetches from the server.
+   * Returns the data of a subscription to the same query that the server has
+   * answered, otherwise fetches from the server.
    * Because we want to avoid stale data, this method will throw an error
    * if the user is offline or there is no active connection to the server.
    *
