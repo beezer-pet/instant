@@ -1134,6 +1134,26 @@ function exists(reactor, { 'client-event-id': eventId }) {
 
 const opsOf = (sent) => sent.map((msg) => msg.op);
 
+test('the user changes when storage is blocked', async () => {
+  const blocked = () => Promise.reject(new Error('storage is blocked'));
+  class BlockedStorage {
+    getItem = blocked;
+    removeItem = blocked;
+    multiSet = blocked;
+    getAllKeys = blocked;
+  }
+  const reactor = new Reactor({ appId: uuid() });
+  reactor._initStorage(BlockedStorage);
+  reactor._transport = { close() {} };
+  const user = { id: uuid() };
+
+  await reactor.changeCurrentUser(user);
+
+  expect((await reactor.getCurrentUser()).user).toEqual(user);
+  // Long enough for Node to report a rejection nobody handles
+  await sleep(5);
+});
+
 test('queryOnce asks anew when the server holds the query without having answered it', async () => {
   const { reactor, sent } = await connectedReactor();
   const once = reactor.queryOnce(usersQ);

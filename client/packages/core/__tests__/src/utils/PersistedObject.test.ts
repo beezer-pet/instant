@@ -654,6 +654,120 @@ test('PersistedObject loads nothing more from storage when the unloaded keys can
   expect(await PO.waitForKeyToLoad('a')).toBeUndefined();
 });
 
+// ---------------------------------------------------------------------------
+// Storage that fails. Vitest also fails the run on an unhandled rejection.
+
+function blockedStorage() {
+  const blocked = () => Promise.reject(new Error('storage is blocked'));
+  return {
+    getItem: blocked,
+    removeItem: blocked,
+    multiSet: blocked,
+    getAllKeys: blocked,
+  };
+}
+
+test('PersistedObject keeps values in memory when storage is blocked', async () => {
+  const PO = new PersistedObject<string, string, string>({
+    persister: blockedStorage(),
+    merge: (_k, storage, memory) => memory ?? storage,
+    serialize: (_k, x) => x,
+    parse: (_k, x) => x,
+    objectSize: (x) => x.length,
+    logger: devNullLogger,
+    preloadEntryCount: 10,
+    gc: null,
+  });
+  expect(await PO.waitForMetaToLoad()).toBeNull();
+
+  PO.updateInPlace((prev) => {
+    prev.a = 'first';
+  });
+  expect(await PO.waitForKeyToLoad('a')).toBe('first');
+  expect(await PO.flush()).toBe(0);
+});
+
+test('PersistedObject goes on after a save that fails', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  const error = vi.fn();
+  const PO = new PersistedObject<string, string, string>({
+    persister: idb,
+    merge: (_k, storage, memory) => memory ?? storage,
+    serialize: (_k, x) => x,
+    parse: (_k, x) => x,
+    objectSize: (x) => x.length,
+    logger: { ...devNullLogger, error },
+    saveThrottleMs: 0,
+    gc: null,
+  });
+  await PO.waitForMetaToLoad();
+  await PO.waitForKeyToLoad('a');
+
+  const multiSet = vi
+    .spyOn(idb, 'multiSet')
+    .mockRejectedValueOnce(new Error('no space'));
+  PO.updateInPlace((prev) => {
+    prev.a = 'first';
+  });
+  await vi.waitFor(() => expect(error).toHaveBeenCalledTimes(1));
+
+  PO.updateInPlace((prev) => {
+    prev.a = 'second';
+  });
+  await vi.waitFor(async () => expect(await idb.getItem('a')).toBe('second'));
+  expect(multiSet).toHaveBeenCalledTimes(2);
+});
+
+test('IndexedDBStorage rejects when the database opens without a result', async () => {
+  const open = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+    const request = {} as IDBOpenDBRequest;
+    queueMicrotask(() =>
+      request.onsuccess!({ target: request } as unknown as Event),
+    );
+    return request;
+  });
+  try {
+    const idb = new IndexedDBStorage(randomUUID(), 'kv');
+    await expect(idb.getItem('a')).rejects.toThrow('without a database');
+  } finally {
+    open.mockRestore();
+  }
+});
+
+test('IndexedDBStorage rejects when a closed database does not open again', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'kv');
+  const db = await idb._dbPromise;
+  const open = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+    throw new Error('denied');
+  });
+  try {
+    db.onclose!(new Event('close'));
+    // Long enough for Node to report a rejection nobody handles
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await expect(idb.getItem('a')).rejects.toThrow('denied');
+  } finally {
+    open.mockRestore();
+  }
+});
+
+test('IndexedDBStorage rejects with the error of a database that does not open', async () => {
+  const open = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+    const request = {
+      error: new Error('denied'),
+    } as unknown as IDBOpenDBRequest;
+    queueMicrotask(() =>
+      request.onerror!({ target: request } as unknown as Event),
+    );
+    return request;
+  });
+  try {
+    const idb = new IndexedDBStorage(randomUUID(), 'kv');
+    await expect(idb.getItem('a')).rejects.toThrow('denied');
+  } finally {
+    open.mockRestore();
+  }
+});
+
 test('IndexedDBStorage recovers when the database connection closes', async () => {
   const idb = new IndexedDBStorage(randomUUID(), 'kv');
 

@@ -2478,7 +2478,9 @@ export default class Reactor {
         delete prev[k].result;
       });
     });
-    this.querySubs.clearUnloadedKeys();
+    this.querySubs
+      .clearUnloadedKeys()
+      .catch((e) => this._log.error('Clearing stored queries failed:', e));
     this._updatePendingMutations((prev) => {
       // Mark all pending mutations with an error, since we won't be able to
       // deliver the result

@@ -141,7 +141,8 @@ export class PersistedObject<K extends string, T, SerializedT> {
     }
     try {
       const p = this._persister.getItem(META_KEY);
-      this._meta.loadingPromise = p;
+      // Never rejects, `_meta` holds the outcome
+      this._meta.loadingPromise = p.catch(() => null);
       const v = await p;
       this._meta.isLoading = false;
       this._meta.error = null;
@@ -156,6 +157,7 @@ export class PersistedObject<K extends string, T, SerializedT> {
         objects: { ...existingObjects, ...objects },
       } as Meta<K>;
     } catch (e) {
+      this._meta.isLoading = false;
       this._meta.error = e;
       this._meta.attempts++;
       this._meta.loadingPromise = null;
@@ -299,8 +301,7 @@ export class PersistedObject<K extends string, T, SerializedT> {
     const metaValue = this._meta.value;
     if (!metaValue) {
       // If it's not loading and we don't have the data, then there
-      // must be an error and we're not going to be able to save until
-      // the error is resolved elsewhere.
+      // must be an error and we're not going to be able to save.
       return Promise.resolve(0);
     }
     const keysToDelete: K[] = [];
@@ -562,7 +563,9 @@ export class PersistedObject<K extends string, T, SerializedT> {
     }
 
     this.currentValue = state;
-    this._enqueuePersist();
+    this._enqueuePersist().catch((e) =>
+      this._log.error('Persisted Object save failed:', e),
+    );
     for (const cb of this._subs) {
       cb(this.currentValue);
     }

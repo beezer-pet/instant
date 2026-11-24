@@ -203,18 +203,25 @@ export default class IndexedDBStorage extends StoreInterface {
       let requiresUpgrade = false;
       const request = indexedDB.open(this.dbName, 1);
 
-      request.onerror = (event) => {
-        reject(event);
+      request.onerror = () => {
+        reject(request.error);
       };
 
       request.onsuccess = (event) => {
         const target = event.target as IDBOpenDBRequest;
         const db = target.result;
+        // Safari can report success for an open that was aborted
+        if (!db) {
+          reject(new Error('IndexedDB opened without a database'));
+          return;
+        }
         // Browsers can close IndexedDB connections unexpectedly
         // (e.g. backgrounded tabs, memory pressure, version changes from
         // other tabs). Re-init so the next operation gets a fresh connection.
         db.onclose = () => {
           this._dbPromise = this._init();
+          // The next operation gets the rejection
+          this._dbPromise.catch(() => {});
         };
         db.onversionchange = () => {
           db.close();
