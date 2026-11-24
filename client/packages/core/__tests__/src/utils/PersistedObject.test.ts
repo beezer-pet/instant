@@ -477,6 +477,7 @@ test('PersistedObject leaves storage as it is when a key is unloaded before it h
   const snapshot = await idbSnapshot(idb, { includeMeta: true });
   expect(snapshot.a).toBe('first');
   expect(snapshot.__meta.objects.a.size).toBe(5);
+  expect(PO.currentValue).toStrictEqual({});
 });
 
 test('PersistedObject leaves storage as it is when a key is unloaded before the meta has loaded', async () => {
@@ -549,6 +550,49 @@ test('PersistedObject garbage collects a key that was saved as it was unloaded',
   const snapshot = await idbSnapshot(idb, { includeMeta: true });
   expect(snapshot.a).toBeUndefined();
   expect(Object.keys(snapshot.__meta.objects)).toStrictEqual(['b']);
+});
+
+// ---------------------------------------------------------------------------
+// A key unloaded while it is read from storage
+
+test('PersistedObject does not load a key that is unloaded while it is read', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+
+  const PO = stringsIn(idb);
+  const loaded = [];
+  PO.onKeyLoaded = (k) => loaded.push(k);
+  const waiter = PO.waitForKeyToLoad('a');
+  PO.unloadKey('a');
+
+  expect(await waiter).toBeUndefined();
+  expect(PO.currentValue).toStrictEqual({});
+  expect(loaded).toStrictEqual([]);
+
+  // the next load reads it
+  expect(await PO.waitForKeyToLoad('a')).toBe('first');
+  expect(loaded).toStrictEqual(['a']);
+});
+
+test('PersistedObject loads a key once when it is unloaded and loaded again while it is read', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+
+  const PO = stringsIn(idb);
+  const loaded = [];
+  PO.onKeyLoaded = (k) => loaded.push(k);
+  const firstWaiter = PO.waitForKeyToLoad('a');
+
+  // storage changes between the two reads, as another tab changes it
+  const stored = idb.setItem('a', 'second');
+  PO.unloadKey('a');
+  const secondWaiter = PO.waitForKeyToLoad('a');
+
+  expect(await firstWaiter).toBe('second');
+  expect(await secondWaiter).toBe('second');
+  await stored;
+  expect(PO.currentValue).toStrictEqual({ a: 'second' });
+  expect(loaded).toStrictEqual(['a']);
 });
 
 test('IndexedDBStorage recovers when the database connection closes', async () => {

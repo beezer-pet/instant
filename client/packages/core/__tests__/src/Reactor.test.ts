@@ -991,6 +991,19 @@ test('a query left as its answer arrives is gone from storage once the user chan
   expect(await storedUsers(reactor, appId)).toBeNull();
 });
 
+test('a query left in the turn it was opened in is not read back into memory', async () => {
+  const appId = uuid();
+  const { reactor, close } = await reactorOnUsers(appId);
+  await answerUsers(reactor, zenecaTriples, 1);
+  close();
+
+  reactor.subscribeQuery(usersQ, () => {})();
+  await storageAnswered(reactor);
+
+  expect(reactor.querySubs.currentValue).toStrictEqual({});
+  expect(await storedUsers(reactor, appId)).toHaveProperty('result');
+});
+
 // ---------------------------------------------------------------------------
 // queryOnce when the server answers that it holds the query
 

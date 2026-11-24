@@ -207,6 +207,10 @@ export class PersistedObject<K extends string, T, SerializedT> {
       return this.currentValue[k];
     }
     await (this._loadingKeys[k] || this._loadKey(k));
+    // Waits also for the read of a key that was unloaded and loaded again.
+    while (k in this._loadingKeys) {
+      await this._loadingKeys[k];
+    }
     return this.currentValue[k];
   }
 
@@ -238,6 +242,10 @@ export class PersistedObject<K extends string, T, SerializedT> {
     const p = this._getFromStorage(k);
     this._loadingKeys[k] = p;
     const value = await p;
+    if (this._loadingKeys[k] !== p) {
+      // The key was unloaded while it was read.
+      return;
+    }
     delete this._loadingKeys[k];
     this._loadedKeys.add(k);
 
