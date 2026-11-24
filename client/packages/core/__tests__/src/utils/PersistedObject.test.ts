@@ -529,6 +529,7 @@ test('PersistedObject clears a key that was unloaded before its save', async () 
 
   const snapshot = await idbSnapshot(idb, { includeMeta: true });
   expect(snapshot.a).toBeUndefined();
+  expect(snapshot.b).toBe('kept');
   expect(Object.keys(snapshot.__meta.objects)).toStrictEqual(['b']);
 });
 
@@ -593,6 +594,64 @@ test('PersistedObject loads a key once when it is unloaded and loaded again whil
   await stored;
   expect(PO.currentValue).toStrictEqual({ a: 'second' });
   expect(loaded).toStrictEqual(['a']);
+});
+
+// ---------------------------------------------------------------------------
+// A key loaded while the unloaded keys are cleared
+
+/** Strings with the key `live` in memory, whose save waits. */
+async function stringsWithLiveKeyIn(idb) {
+  const PO = stringsIn(idb);
+  await PO.waitForMetaToLoad();
+  PO.updateInPlace((prev) => {
+    prev.live = 'kept';
+  });
+  return PO;
+}
+
+test('PersistedObject loads nothing of a key that is read as the unloaded keys are cleared', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+
+  const PO = await stringsWithLiveKeyIn(idb);
+  const waiter = PO.waitForKeyToLoad('a');
+  const cleared = PO.clearUnloadedKeys();
+
+  expect(await waiter).toBeUndefined();
+  await cleared;
+  await PO.flush();
+  expect(PO.currentValue).toStrictEqual({ live: 'kept' });
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBeUndefined();
+  expect(snapshot.live).toBe('kept');
+  expect(Object.keys(snapshot.__meta.objects)).toStrictEqual(['live']);
+});
+
+test('PersistedObject loads nothing of a cleared key before the save that follows', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+  await save(stringsIn(idb), 'b', 'other');
+
+  const PO = await stringsWithLiveKeyIn(idb);
+  const cleared = PO.clearUnloadedKeys();
+
+  expect(await PO.waitForKeyToLoad('a')).toBeUndefined();
+  await cleared;
+  expect(await PO.waitForKeyToLoad('b')).toBeUndefined();
+  await PO.flush();
+});
+
+test('PersistedObject loads nothing more from storage when the unloaded keys cannot be cleared', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+
+  const failing = Object.create(idb);
+  failing.getAllKeys = () => Promise.reject(new Error('no keys'));
+  const PO = stringsIn(failing);
+  await PO.waitForMetaToLoad();
+
+  await expect(PO.clearUnloadedKeys()).rejects.toThrow('no keys');
+  expect(await PO.waitForKeyToLoad('a')).toBeUndefined();
 });
 
 test('IndexedDBStorage recovers when the database connection closes', async () => {

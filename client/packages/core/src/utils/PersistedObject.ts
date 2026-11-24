@@ -91,6 +91,10 @@ export class PersistedObject<K extends string, T, SerializedT> {
   private _pendingSaveKeys: Set<K> = new Set();
   private _loadedKeys: Set<K> = new Set();
   private _loadingKeys: Record<K, Promise<T>>;
+  // The calls of clearUnloadedKeys, and how many of them have not removed
+  // the stored values.
+  private _clears = 0;
+  private _clearing = 0;
   private _objectSize: (serializedObject: SerializedT) => number;
   private _log: Logger;
 
@@ -239,6 +243,8 @@ export class PersistedObject<K extends string, T, SerializedT> {
 
   private async _loadKey(k: K) {
     if (this._loadedKeys.has(k) || k in this._loadingKeys) return;
+    const clears = this._clears;
+    const clearing = this._clearing;
     const p = this._getFromStorage(k);
     this._loadingKeys[k] = p;
     const value = await p;
@@ -249,7 +255,8 @@ export class PersistedObject<K extends string, T, SerializedT> {
     delete this._loadingKeys[k];
     this._loadedKeys.add(k);
 
-    if (value) {
+    // A value read while clearUnloadedKeys ran is from before it.
+    if (value && !clearing && clears === this._clears) {
       const merged = this._merge(k, value, this.currentValue[k]);
       if (merged) {
         this.currentValue[k] = merged;
@@ -571,19 +578,26 @@ export class PersistedObject<K extends string, T, SerializedT> {
     };
   }
 
-  // Removes any keys that we haven't loaded--used when
-  // changing users to make sure we clean out all user data
+  // Removes the keys that are not in currentValue from storage--used when
+  // changing users to make sure we clean out all user data.
+  // Every stored value is removed, and the keys in currentValue are saved
+  // again. A key loaded from the call on takes nothing from storage until
+  // the values are removed, or for as long as this object lives if storage
+  // fails to remove them.
   public async clearUnloadedKeys(): Promise<void> {
-    let needsPersist = false;
-    for (const key of await this._persister.getAllKeys()) {
-      if (key === META_KEY || key in this.currentValue) {
-        continue;
-      }
-
-      this._pendingSaveKeys.add(key as K);
-      needsPersist = true;
-    }
-    if (needsPersist) {
+    this._clears++;
+    this._clearing++;
+    const keys = (await this._persister.getAllKeys()).filter(
+      (key) => key !== META_KEY,
+    );
+    await Promise.all(
+      keys.map((key) => {
+        this._pendingSaveKeys.add(key as K);
+        return this._persister.removeItem(key);
+      }),
+    );
+    this._clearing--;
+    if (keys.length) {
       await this._enqueuePersist();
     }
   }

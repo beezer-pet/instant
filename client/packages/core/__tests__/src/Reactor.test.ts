@@ -572,9 +572,9 @@ function triplesWithJoeAs(handle) {
 }
 
 /** A reactor subscribed to `usersQ`, and every answer its subscriber got. */
-async function reactorOnUsers(appId = uuid()) {
+async function reactorOnUsers(appId = uuid(), Storage = IndexedDBStorage) {
   const reactor = new Reactor({ appId });
-  reactor._initStorage(IndexedDBStorage);
+  reactor._initStorage(Storage);
   reactor._setAttrs(zenecaAttrs);
   await waitForLoaded(reactor);
   await reactor.querySubs.waitForKeyToLoad(weakHash(usersQ));
@@ -1002,6 +1002,107 @@ test('a query left in the turn it was opened in is not read back into memory', a
 
   expect(reactor.querySubs.currentValue).toStrictEqual({});
   expect(await storedUsers(reactor, appId)).toHaveProperty('result');
+});
+
+// ---------------------------------------------------------------------------
+// A stored answer when the user changes
+
+/** A reactor that nobody is subscribed to, with an answer to `usersQ` in storage. */
+async function reactorWithStoredUsers(appId, Storage = IndexedDBStorage) {
+  const { reactor, close } = await reactorOnUsers(appId, Storage);
+  await answerUsers(reactor, zenecaTriples, 1);
+  close();
+  await waitForLoaded(reactor);
+  reactor._transport = { close() {} };
+  return reactor;
+}
+
+test('a query opened as the user changes gets nothing of the stored answer', async () => {
+  const appId = uuid();
+  const reactor = await reactorWithStoredUsers(appId);
+
+  reactor.updateUser({ id: uuid() });
+  const seen = await reopenUsers(reactor);
+
+  expect(seen).toEqual([]);
+  expect((await storedUsers(reactor, appId)).result).toBeUndefined();
+});
+
+test('a query opened after the user changed, before the next save, gets nothing of the stored answer', async () => {
+  const appId = uuid();
+  const reactor = await reactorWithStoredUsers(appId);
+
+  reactor.updateUser({ id: uuid() });
+  await storageAnswered(reactor);
+  const seen = await reopenUsers(reactor);
+
+  expect(seen).toEqual([]);
+  expect((await storedUsers(reactor, appId)).result).toBeUndefined();
+});
+
+test('a query that is read from storage as the user changes gets nothing of the stored answer', async () => {
+  const appId = uuid();
+  const reactor = await reactorWithStoredUsers(appId);
+
+  const seen = [];
+  reactor.subscribeQuery(usersQ, (res) => seen.push(res.data.users));
+  reactor.updateUser({ id: uuid() });
+  await reactor.querySubs.waitForKeyToLoad(weakHash(usersQ));
+
+  expect(seen).toEqual([]);
+  expect((await storedUsers(reactor, appId)).result).toBeUndefined();
+});
+
+test('a stored answer is not merged once the user has changed, whenever its read ends', async () => {
+  const hash = weakHash(usersQ);
+  // storage that answers in microtasks: the user changes at every step
+  // between the read and the merge
+  for (let ticks = 0; ticks < 8; ticks++) {
+    const reactor = await reactorWithStoredUsers(uuid(), InMemoryStorage);
+    let seen = 0;
+    reactor.subscribeQuery(usersQ, () => seen++);
+    for (let i = 0; i < ticks; i++) {
+      await Promise.resolve();
+    }
+    reactor.updateUser({ id: uuid() });
+    const seenBefore = seen;
+    await reactor.querySubs.waitForKeyToLoad(hash);
+    await waitForLoaded(reactor);
+
+    expect(seen).toBe(seenBefore);
+    expect(reactor.querySubs.currentValue[hash].result).toBeUndefined();
+  }
+});
+
+test('a stored answer that is preloaded as the user changes is gone from memory and storage', async () => {
+  const appId = uuid();
+  await reactorWithStoredUsers(appId);
+
+  const reactor = new Reactor({ appId });
+  reactor._initStorage(IndexedDBStorage);
+  reactor._setAttrs(zenecaAttrs);
+  reactor._transport = { close() {} };
+  await reactor.querySubs.waitForMetaToLoad();
+  reactor.updateUser({ id: uuid() });
+
+  expect(await storedUsers(reactor, appId)).toBeNull();
+  expect(reactor.querySubs.currentValue).toStrictEqual({});
+});
+
+test('the next page load of the same user shows the stored answer', async () => {
+  const appId = uuid();
+  const user = { id: uuid(), refresh_token: uuid() };
+  const { reactor } = await reactorOnUsers(appId);
+  reactor._transport = { close() {} };
+  await reactor.changeCurrentUser(user);
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  const { reactor: reloaded, seen } = await reactorOnUsers(appId);
+  reloaded._transport = { close() {} };
+  await reloaded.changeCurrentUser(user);
+
+  expect(seen.map(handlesOf)).toEqual([['joe', 'alex', 'stopa', 'nicolegf']]);
+  expect(await storedUsers(reloaded, appId)).toHaveProperty('result');
 });
 
 // ---------------------------------------------------------------------------
