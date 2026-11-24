@@ -930,3 +930,63 @@ test('a query opened again by another user has nothing of the transactions accep
   const seen = await reopenUsers(reactor);
   expect(seen.map((users) => joeOf(users).handle)).toEqual(['joe']);
 });
+
+// ---------------------------------------------------------------------------
+// A query left before its answer is saved
+
+function receiveUsers(reactor, processedTxId) {
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q: usersQ,
+    'processed-tx-id': processedTxId,
+    result: usersResult(zenecaTriples),
+  });
+}
+
+/** Resolves once storage has answered what the reactor has asked it. */
+function storageAnswered(reactor) {
+  return reactor.querySubs._persister.getAllKeys();
+}
+
+/** What storage holds for `usersQ` once the reactor has cleared and saved. */
+async function storedUsers(reactor, appId) {
+  await storageAnswered(reactor);
+  await waitForLoaded(reactor);
+  return new IndexedDBStorage(appId, 'querySubs').getItem(weakHash(usersQ));
+}
+
+test('a query left as its answer arrives has the answer in storage', async () => {
+  const appId = uuid();
+  const { reactor, close } = await reactorOnUsers(appId);
+  receiveUsers(reactor, 1);
+  close();
+  await waitForLoaded(reactor);
+
+  const { seen } = await reactorOnUsers(appId);
+  expect(seen.map(handlesOf)).toEqual([['joe', 'alex', 'stopa', 'nicolegf']]);
+});
+
+test('a query left after the user changed leaves no answer in storage', async () => {
+  const appId = uuid();
+  const { reactor, close } = await reactorOnUsers(appId);
+  await answerUsers(reactor, zenecaTriples, 1);
+
+  reactor._transport = { close() {} };
+  reactor.updateUser({ id: uuid() });
+  await storageAnswered(reactor);
+  close();
+
+  expect((await storedUsers(reactor, appId))?.result).toBeUndefined();
+});
+
+test('a query left as its answer arrives is gone from storage once the user changes', async () => {
+  const appId = uuid();
+  const { reactor, close } = await reactorOnUsers(appId);
+  receiveUsers(reactor, 1);
+  close();
+
+  reactor._transport = { close() {} };
+  reactor.updateUser({ id: uuid() });
+
+  expect(await storedUsers(reactor, appId)).toBeNull();
+});

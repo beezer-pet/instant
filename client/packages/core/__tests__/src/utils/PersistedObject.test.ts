@@ -392,6 +392,155 @@ test('PersistedObject garbage collects when we exceed max age', async () => {
   expect(snapshot3).toStrictEqual({});
 });
 
+// ---------------------------------------------------------------------------
+// A key unloaded while its save waits
+
+/** Strings saved a second after they change, or at the next flush. */
+function stringsIn(idb, maxEntries = Number.MAX_SAFE_INTEGER) {
+  return new PersistedObject<string, string, string>({
+    persister: idb,
+    merge: (_k, storage, memory) => memory ?? storage,
+    serialize: (_k, x) => x,
+    parse: (_k, x) => x,
+    objectSize: (x) => x.length,
+    logger: devNullLogger,
+    saveThrottleMs: 1000,
+    gc: {
+      maxAgeMs: Number.MAX_SAFE_INTEGER,
+      maxEntries,
+      maxSize: Number.MAX_SAFE_INTEGER,
+    },
+  });
+}
+
+async function save(PO, k, v) {
+  await PO.waitForMetaToLoad();
+  PO.updateInPlace((prev) => {
+    prev[k] = v;
+  });
+  await PO.waitForKeyToLoad(k);
+  await PO.flush();
+}
+
+test('PersistedObject saves the value of a key that is unloaded before its save', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  const PO = stringsIn(idb);
+  await save(PO, 'a', 'first');
+
+  PO.updateInPlace((prev) => {
+    prev.a = 'the second';
+  });
+  PO.unloadKey('a');
+  await PO.flush();
+
+  expect(PO.currentValue).toStrictEqual({});
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBe('the second');
+  expect(snapshot.__meta.objects.a.size).toBe(10);
+});
+
+test('PersistedObject loads the newest value of a key that was unloaded before its save', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  const PO = stringsIn(idb);
+  await save(PO, 'a', 'first');
+
+  PO.updateInPlace((prev) => {
+    prev.a = 'second';
+  });
+  PO.unloadKey('a');
+
+  expect(await PO.waitForKeyToLoad('a')).toBe('second');
+});
+
+test('PersistedObject leaves storage as it is when a key is unloaded before it has loaded', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+
+  const PO = stringsIn(idb);
+  await PO.waitForMetaToLoad();
+  PO.updateInPlace((prev) => {
+    prev.a = 'second';
+  });
+  PO.unloadKey('a');
+  await PO.flush();
+
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBe('first');
+  expect(snapshot.__meta.objects.a.size).toBe(5);
+});
+
+test('PersistedObject leaves storage as it is when a key is unloaded before the meta has loaded', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  await save(stringsIn(idb), 'a', 'first');
+
+  const PO = stringsIn(idb);
+  PO.updateInPlace((prev) => {
+    prev.a = 'second';
+  });
+  PO.unloadKey('a');
+  await PO.waitForMetaToLoad();
+  await PO.flush();
+
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBe('first');
+  expect(snapshot.__meta.objects.a.size).toBe(5);
+});
+
+test('PersistedObject removes a deleted key from storage when it is unloaded and loaded again', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  const PO = stringsIn(idb);
+  await save(PO, 'a', 'first');
+
+  PO.updateInPlace((prev) => {
+    delete prev.a;
+  });
+  PO.unloadKey('a');
+
+  expect(await PO.waitForKeyToLoad('a')).toBeUndefined();
+  await PO.flush();
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBeUndefined();
+  expect(snapshot.__meta.objects).toStrictEqual({});
+});
+
+test('PersistedObject clears a key that was unloaded before its save', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  const PO = stringsIn(idb);
+  await save(PO, 'a', 'first');
+  await save(PO, 'b', 'kept');
+
+  PO.updateInPlace((prev) => {
+    prev.a = 'second';
+  });
+  PO.unloadKey('a');
+  await PO.clearUnloadedKeys();
+  await PO.flush();
+
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBeUndefined();
+  expect(Object.keys(snapshot.__meta.objects)).toStrictEqual(['b']);
+});
+
+test('PersistedObject garbage collects a key that was saved as it was unloaded', async () => {
+  const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
+  const PO = stringsIn(idb, 1);
+  await save(PO, 'a', 'first');
+  await save(PO, 'b', 'live');
+
+  PO.updateInPlace((prev) => {
+    prev.a = 'second';
+  });
+  PO.unloadKey('a');
+
+  // @ts-expect-error: allow access to private fields for test
+  await PO._gc();
+  await PO.flush();
+
+  const snapshot = await idbSnapshot(idb, { includeMeta: true });
+  expect(snapshot.a).toBeUndefined();
+  expect(Object.keys(snapshot.__meta.objects)).toStrictEqual(['b']);
+});
+
 test('IndexedDBStorage recovers when the database connection closes', async () => {
   const idb = new IndexedDBStorage(randomUUID(), 'kv');
 

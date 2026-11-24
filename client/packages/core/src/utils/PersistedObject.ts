@@ -216,8 +216,18 @@ export class PersistedObject<K extends string, T, SerializedT> {
   }
 
   // Unloads the key so that it can be garbage collected, but does not
-  // delete it. Removes the key from currentValue.
+  // delete it. Removes the key from currentValue. A save that waits for
+  // the key is written first.
   public unloadKey(k: K) {
+    if (this._pendingSaveKeys.has(k)) {
+      this._writeToStorage().catch((e) =>
+        this._log.error('Persisted Object save failed:', e),
+      );
+      if (k in this.currentValue) {
+        // The key could not be written yet, so storage keeps what it holds.
+        this._pendingSaveKeys.delete(k);
+      }
+    }
     this._loadedKeys.delete(k);
     delete this._loadingKeys[k];
     delete this.currentValue[k];
