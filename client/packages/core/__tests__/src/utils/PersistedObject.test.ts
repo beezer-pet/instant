@@ -19,6 +19,13 @@ async function idbSnapshot(idb, { includeMeta }) {
 
 const devNullLogger = createLogger(false, () => ({}));
 
+async function nextMillisecond() {
+  const now = Date.now();
+  while (Date.now() === now) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 test('PersistedObject saves values to storage', async () => {
   const idb = new IndexedDBStorage(randomUUID(), 'querySubs');
   const PO = new PersistedObject<string, string, string>({
@@ -354,6 +361,9 @@ test('PersistedObject garbage collects when we exceed max age', async () => {
   PO.unloadKey('e');
 
   await PO.flush();
+
+  // A key saved in this millisecond has not exceeded the max age
+  await nextMillisecond();
 
   // @ts-expect-error: allow access to private fields for test
   await PO._gc();
