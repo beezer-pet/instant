@@ -4,6 +4,7 @@
    [instant.custodian :as custodian]
    [instant.flags :as flags]
    [instant.model.app :as app-model]
+   [instant.model.app-user-magic-code :as app-user-magic-code-model]
    [instant.util.date :as date-util]
    [instant.util.lang :as lang]
    [instant.util.tracer :as tracer]
@@ -53,7 +54,8 @@
           (doseq [{:keys [id app_id]} attrs-to-delete]
             (custodian/enqueue-attr-deletion! {:app-id app_id :attr-id id}))
           (doseq [{:keys [id]} apps-to-delete]
-            (custodian/enqueue-app-deletion! {:app-id id})))))))
+            (custodian/enqueue-app-deletion! {:app-id id})))
+        (app-user-magic-code-model/delete-expired!)))))
 
 (defn start []
   (tracer/record-info! {:name "app-deletion-sweeper/schedule"})

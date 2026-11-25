@@ -1,15 +1,19 @@
 (ns instant.model.app-user-magic-code
   (:require
    [instant.config :as config]
+   [instant.flags :as flags]
    [instant.jdbc.aurora :as aurora]
    [instant.jdbc.sql :as sql]
    [instant.model.app :as app-model]
    [instant.model.app-user :as app-user-model]
    [instant.model.instant-user :as instant-user-model]
+   [instant.system-catalog :as system-catalog]
    [instant.system-catalog-ops :refer [update-op]]
    [instant.util.crypt :as crypt-util]
    [instant.util.exception :as ex]
-   [instant.util.string :refer [rand-num-str]])
+   [instant.util.hsql :as uhsql]
+   [instant.util.string :refer [rand-num-str]]
+   [instant.util.tracer :as tracer])
   (:import
    (java.util Date UUID)))
 
@@ -81,6 +85,43 @@
                           magic-code)
                         :app-user-magic-code
                         {:args [params]}))))
+
+(def ^:private expired-q
+  (uhsql/preformat
+   {:select [:triples.app-id :triples.entity-id]
+    :from   :triples
+    :join   [:apps [:= :apps.id :triples.app-id]]
+    :where  [:and
+             [:= :triples.attr-id :?attr-id]
+             [:<
+              :triples.created-at
+              [:-
+               :?now-ms
+               [:* [:cast [:inline 60000] :bigint] [:coalesce :apps.magic-code-expiry-minutes :?default-expiry-minutes]]]]]}))
+
+(defn delete-expired!
+  "Deletes every app's expired codes."
+  ([] (delete-expired! (aurora/conn-pool :write)))
+  ([conn]
+   (let [codes (sql/select ::delete-expired!
+                           conn
+                           (uhsql/formatp expired-q
+                                          {:attr-id (system-catalog/get-attr-id etype "id")
+                                           :now-ms (System/currentTimeMillis)
+                                           :default-expiry-minutes (flags/default-magic-code-expiry-minutes)}))]
+     (doseq [[app-id app-codes] (group-by :app_id codes)]
+       (try
+         (doseq [batch (partition-all 1000 app-codes)]
+           (update-op
+            conn
+            {:app-id app-id
+             :etype etype}
+            (fn [{:keys [delete-entities!]}]
+              (delete-entities! (map :entity_id batch)
+                                {:skip-app-status-write-check? true}))))
+         (catch Exception e
+           (tracer/record-exception-span! e {:name "app-user-magic-code/delete-expired-error"
+                                             :attributes {:app-id app-id}})))))))
 
 (comment
   (def instant-user (instant-user-model/get-by-email

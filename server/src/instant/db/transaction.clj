@@ -10,10 +10,11 @@
    [instant.jdbc.aurora :as aurora]
    [instant.jdbc.sql :as sql]
    [instant.model.app :as app-model]
-   [instant.system-catalog :refer [system-catalog-app-id]]
+   [instant.system-catalog :as system-catalog :refer [system-catalog-app-id]]
    [instant.util.coll :as coll]
    [instant.util.exception :as ex]
    [instant.util.e2e-tracer :as e2e-tracer]
+   [instant.util.hsql :as uhsql]
    [instant.util.json :refer [->json]]
    [instant.util.string :as string-util]
    [instant.util.tracer :as tracer]
@@ -529,6 +530,45 @@
             :etype etype
             :value rule-params}))))))
 
+(def ^:private user-magic-codes-q
+  (uhsql/preformat
+   {:select :entity-id
+    :from   :triples
+    :where  [:and
+             :ave
+             [:= :app-id :?app-id]
+             [:= :attr-id :?code-email-attr-id]
+             [:= :value [:any [:array {:select :value
+                                       :from   :triples
+                                       :where  [:and
+                                                :ea
+                                                [:= :app-id :?app-id]
+                                                [:= :attr-id :?user-email-attr-id]
+                                                [:= :entity-id [:any :?user-ids]]]}]]]]}))
+
+(defn expand-delete-user-magic-codes
+  "Adds deletes of the deleted users' sign-in codes, found by email."
+  [conn app-id tx-step-maps]
+  (let [user-ids (for [{:keys [op eid etype]} tx-step-maps
+                       :when (and (= :delete-entity op)
+                                  (= "$users" etype))]
+                   eid)]
+    (if (empty? user-ids)
+      tx-step-maps
+      (concat
+       tx-step-maps
+       (for [{:keys [entity_id]}
+             (sql/select ::expand-delete-user-magic-codes
+                         conn
+                         (uhsql/formatp user-magic-codes-q
+                                        {:app-id app-id
+                                         :user-ids (with-meta (vec user-ids) {:pgtype "uuid[]"})
+                                         :user-email-attr-id (system-catalog/get-attr-id "$users" "email")
+                                         :code-email-attr-id (system-catalog/get-attr-id "$magicCodes" "email")}))]
+         {:op    :delete-entity
+          :eid   entity_id
+          :etype "$magicCodes"})))))
+
 (defn validate-value-lookup-etypes
   "Check that in the case of
 
@@ -717,7 +757,8 @@
        (mapify-tx-steps attrs)
        (resolve-lookups-for-delete-entity conn app-id)
        (resolve-etypes-for-delete-entity conn app-id)
-       (expand-delete-entity-cascade conn app-id attrs)))
+       (expand-delete-entity-cascade conn app-id attrs)
+       (expand-delete-user-magic-codes conn app-id)))
 
 (defn transact-without-tx-conn! [conn attrs app-id tx-step-vecs opts]
   (let [ops-order     (tx-steps-order tx-step-vecs)
