@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [get get-in and or = not=])
   (:import (com.google.protobuf NullValue)
            (dev.cel.common.ast CelConstant CelExpr CelExprFactory)
-           (dev.cel.parser Operator)))
+           (dev.cel.common Operator)))
 
 (set! *warn-on-reflection* true)
 

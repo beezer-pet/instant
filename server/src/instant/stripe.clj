@@ -152,11 +152,13 @@
 
 (defn discount-amount [items-revenue ^Discount discount]
   (let [amount-off (-> discount
-                       (.getCoupon)
+                       (.getSource)
+                       (.getCouponObject)
                        (.getAmountOff)
                        (or 0))
         percent-off (-> discount
-                        (.getCoupon)
+                        (.getSource)
+                        (.getCouponObject)
                         (.getPercentOff)
                         (or 0))]
     (+ amount-off
@@ -213,7 +215,7 @@
 
 (defn subscriptions []
   (let [params (-> (SubscriptionListParams/builder)
-                   (.addExpand "data.discounts")
+                   (.addExpand "data.discounts.source.coupon")
                    (.addExpand "data.customer")
                    (.setStatus SubscriptionListParams$Status/ACTIVE)
                    (.setLimit 100)

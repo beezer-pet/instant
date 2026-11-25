@@ -63,7 +63,7 @@
    ;; Good: {:select :* :where [:= :type [:inline "my-type"]]}
    :post [(every? (fn [arg] (::hsql/wrapper (meta arg)))
                   (rest %))]}
-  (binding [hsql/*clause-order* (deref (deref #'hsql/current-clause-order))]
+  (binding [hsql/*options* (assoc @#'hsql/*options* :clause-order (hsql/clause-order))]
     (hsql/format-dsl q nil)))
 
 (defn formatp
@@ -79,5 +79,5 @@
 
   You must use predefined params, e.g. `[:= :id :?id]` not `[:= :id 1]`"
   [preformatted-query params]
-  (binding [hsql/*params* params]
+  (binding [hsql/*options* {:params params}]
     (mapv #(#'hsql/unwrap % {}) preformatted-query)))
