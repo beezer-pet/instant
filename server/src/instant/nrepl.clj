@@ -34,7 +34,7 @@
                               (catch Exception _e nil))
         record-middleware (when (= :prod (config/get-env))
                             #'wrap-record)]
-    (cond-> cider-middleware
+    (cond-> (mapv requiring-resolve cider-middleware)
       refactor-middleware (conj refactor-middleware)
       record-middleware (conj record-middleware))))
 

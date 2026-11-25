@@ -5,6 +5,7 @@
    [instant.data.resolvers :as resolvers]
    [instant.db.model.attr :as attr-model]
    [instant.fixtures :refer [with-zeneca-app]]
+   [instant.isn :as isn]
    [instant.jdbc.aurora :as aurora]
    [instant.reactive.query :as rq]
    [instant.reactive.store :as rs]
@@ -242,6 +243,51 @@
           (is (nil? (bump! ctx)))
           (write! ctx)
           (is (= before (datoms))))))))
+
+(deftest transactions-on-a-large-store
+  (let [store (rs/init)
+        app-id (random-uuid)
+        sess-ids (vec (repeatedly 20 random-uuid))
+        qs (mapv (fn [i] {:users {:$ {:where {:n i}}}}) (range 10))
+        dqs (mapv (fn [i] [[:ea i]]) (range 10))
+        conn (rs/app-conn store app-id)
+        refresh! (fn [sess-id q]
+                   (let [iq-ent (rs/bump-instaql-version! store app-id sess-id q :join-rows)
+                         ctx {:app-id app-id
+                              :session-id sess-id
+                              :instaql-query q
+                              :instaql-query-eid (:db/id iq-ent)
+                              :v (:instaql-query/version iq-ent)}]
+                     (doseq [dq dqs]
+                       (rs/record-datalog-query-start! store ctx dq #{})
+                       (rs/record-datalog-query-finish! store ctx dq {:topics '[[:ea _ _ _]]}))
+                     (rs/add-instaql-query! store ctx (:v ctx))))
+        in-each-session (fn [f]
+                          (->> sess-ids
+                               (mapv (fn [sess-id] (ua/vfuture (f sess-id))))
+                               (run! deref)))
+        values (fn [attr]
+                 (frequencies (map :v (d/datoms @conn :aevt attr))))]
+    (doseq [sess-id sess-ids]
+      (rs/assoc-session! store sess-id :session/auth {:app {:id app-id}}))
+    (doseq [v [1 2 3]]
+      (testing (str "refresh " v " leaves the subscriptions of that version")
+        (in-each-session (fn [sess-id]
+                           (run! #(refresh! sess-id %) qs)))
+        (is (= {v 2000} (values :subscription/v)))))
+    (testing "a write marks every query stale"
+      (let [dq-eids (mapv :e (d/datoms @conn :aevt :datalog-query/query))]
+        (#'rs/mark-datalog-queries-stale! conn app-id 1 (isn/get-max-seen-isn) dq-eids)
+        (is (= {true 200} (values :instaql-query/stale?)))))
+    (testing "a session that leaves takes its queries with it"
+      (in-each-session (fn [sess-id]
+                         (run! #(refresh! sess-id %) qs)))
+      (rs/remove-session! store app-id (first sess-ids))
+      (is (= {4 1900} (values :subscription/v))))
+    (testing "no subscription is left once the queries are removed"
+      (in-each-session (fn [sess-id]
+                         (run! #(rs/remove-query! store app-id sess-id %) qs)))
+      (is (= {} (values :subscription/v))))))
 
 (defmacro is-match-topic-part [iv-part dq-part expected]
   `(is (= ~expected (#'rs/match-topic-part? ~iv-part ~dq-part))

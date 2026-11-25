@@ -465,9 +465,21 @@
              (not (flags/conn-tx-reset-disabled?)))
     (reset-conn-tx! conn)))
 
+(defn- realize-tx-fns
+  "Makes each db.fn/call in the tx-data realize its transactions at once.
+   Datascript changes its indexes in place during a transaction and throws
+   for a lazy read that is continued after a change."
+  [tx-data]
+  (mapv (fn [tx]
+          (if (and (vector? tx) (= :db.fn/call (first tx)))
+            (update tx 1 #(comp doall %))
+            tx))
+        tx-data))
+
 (defn transact! [span-name conn tx-data]
   (maybe-reset-conn-tx! conn)
-  (let [report (if (or (flags/toggled? :enable-store-batching-globally)
+  (let [tx-data (realize-tx-fns tx-data)
+        report (if (or (flags/toggled? :enable-store-batching-globally)
                        (contains? (flags/flag :enable-store-batching-apps)
                                   (:app-id (meta conn))))
                  (transact-new! span-name conn tx-data)

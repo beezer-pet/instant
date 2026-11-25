@@ -29,7 +29,8 @@
                    CelOptions
                    CelOverloadDecl
                    CelSource
-                   CelValidationException)
+                   CelValidationException
+                   Operator)
    (dev.cel.common.ast CelExpr
                        CelExpr$CelCall
                        CelExpr$CelComprehension
@@ -51,8 +52,7 @@
    (dev.cel.extensions CelExtensions)
    (dev.cel.parser CelStandardMacro
                    CelUnparserFactory
-                   CelUnparser
-                   Operator)
+                   CelUnparser)
    (dev.cel.runtime CelAttribute
                     CelEvaluationException
                     CelFunctionOverload
@@ -444,10 +444,13 @@
 (def custom-fn-decls (mapv :decl custom-fns))
 (def custom-fn-bindings (mapcat :runtimes custom-fns))
 
-(def cel-options (-> (CelOptions/current)
-                     (.populateMacroCalls true)
-                     (.enableUnknownTracking true)
-                     (.build)))
+(def ^CelOptions cel-options
+  (-> (CelOptions/current)
+      (.populateMacroCalls true)
+      (.enableUnknownTracking true)
+      ;; null, timestamps and durations are the protobuf types
+      (.evaluateCanonicalTypesToNativeValues false)
+      (.build)))
 
 ;; n.b. if you edit something here, make sure you make the
 ;;      equivalent change to iql-cel-compiler below
@@ -1488,10 +1491,12 @@
 (def where-custom-fn-decls (mapv :decl where-custom-fns))
 (def where-custom-fn-bindings (mapcat :runtimes where-custom-fns))
 
-(def where-cel-options (-> (CelOptions/current)
-                           (.populateMacroCalls true)
-                           (.retainRepeatedUnaryOperators true)
-                           (.build)))
+(def ^CelOptions where-cel-options
+  (-> (CelOptions/current)
+      (.populateMacroCalls true)
+      (.retainRepeatedUnaryOperators true)
+      (.evaluateCanonicalTypesToNativeValues false)
+      (.build)))
 
 ;; Differences from cel-compiler
 ;; 1. No "newData" var

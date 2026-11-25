@@ -490,28 +490,16 @@
 (defn register-in-progress
   "Registers the statement in the in-progress set (if we're tracking it)
   and returns a closeable that will remove the statement from the set at
-  the end of the query. Calling `.cancel` on the Cancelable will return a promise
-  that will resolve when the query is finally interrupted."
+  the end of the query. Calling `.cancel` on the Cancelable will cancel the
+  statement and return a promise that will resolve when the query is finally
+  interrupted. The connection is closed only by the thread that runs the
+  query: closed from two threads at once, it is given to two owners."
   ^java.lang.AutoCloseable
-  [created-connection? rw ^Connection conn ^PreparedStatement stmt complete]
+  [rw ^PreparedStatement stmt complete]
   (if-let [{:keys [add remove]} *in-progress-stmts*]
     (let [cancelable (reify Cancelable
                        (cancel [_]
-                         (try
-                           (.cancel stmt)
-
-                           ;; Don't close the connection we opened b/c
-                           ;; it seems to cause thread pinning when you
-                           ;; close from a different thread and it will
-                           ;; get closed in the `finally` clause
-                           ;; below. We have to close connections we
-                           ;; were passed to make sure transactions are
-                           ;; rolled back.
-                           (when-not created-connection?
-                             (.close conn))
-                           (catch java.sql.SQLException e
-                             (when (not= "Connection is closed" (.getMessage e))
-                               (throw e))))
+                         (.cancel stmt)
                          complete))]
       (add rw cancelable)
       (reify java.lang.AutoCloseable
@@ -605,7 +593,7 @@
                 (try
                   (apply-postgres-config postgres-config# create-connection?# c#)
                   (with-open [ps# (next-jdbc/prepare c# query# opts#)
-                              _cleanup# (register-in-progress create-connection?# ~rw c# ps# complete#)]
+                              _cleanup# (register-in-progress ~rw ps# complete#)]
                     (let [res# (~query-fn ps# nil opts#)
                           bytes-after# (when bytes-before#
                                          (socket-track/bytes-transferred c#))

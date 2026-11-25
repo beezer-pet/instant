@@ -8,12 +8,13 @@
    [instant.jdbc.sql :as sql]
    [instant.rate-limit :refer [parse-duration]]
    [instant.util.test :refer [wait-for]]
-   [instant.webhook-sender :as webhook-sender])
+   [instant.webhook-sender :as webhook-sender]
+   [next.jdbc :as next-jdbc])
   (:import
    (clojure.lang ExceptionInfo)
    (instant.isn ISN)
    (instant.webhook_sender WebhookAttempt)
-   (java.sql Timestamp)
+   (java.sql Connection Timestamp)
    (java.time Duration Instant)
    (java.time.temporal ChronoUnit)
    (org.postgresql.replication LogSequenceNumber)))
@@ -48,6 +49,30 @@
         (is (future-done? query))
         (is (thrown? Exception @query))
         (is (= 0 (count @(:stmts in-progress))))))))
+
+(deftest canceling-leaves-the-connection-to-its-transaction
+  (let [in-progress (sql/make-statement-tracker)
+        table (str "canceled_tx_" (System/nanoTime))
+        closed? (promise)
+        tx (binding [sql/*in-progress-stmts* in-progress]
+             (future
+               (next-jdbc/with-transaction [^Connection conn (aurora/conn-pool :write)]
+                 (next-jdbc/execute! conn [(str "create table " table " (id int)")])
+                 (try
+                   (sql/select conn ["select pg_sleep(3)"])
+                   (catch Throwable t
+                     (Thread/sleep 200)
+                     (deliver closed? (.isClosed conn))
+                     (throw t))))))]
+    (wait-for (fn []
+                (sql/cancel-in-progress in-progress)
+                (realized? closed?))
+              5000)
+    (is (false? @closed?))
+    (is (thrown? Throwable @tx))
+    (is (= [{:oid nil}]
+           (sql/select (aurora/conn-pool :read)
+                       ["select to_regclass(?) as oid" table])))))
 
 (deftest in-progress-removes-itself-on-query-completion
   (let [in-progress (sql/make-statement-tracker)]

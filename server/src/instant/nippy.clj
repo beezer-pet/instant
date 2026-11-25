@@ -58,13 +58,11 @@
 
 ;; 3 is our custom identifier for StreamRequest, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze StreamRequest 3 [^StreamRequest {:keys [^UUID app-id
-                                                             ^UUID stream-id
-                                                             ^long offset]}
-                                      data-output]
-  (write-uuid data-output app-id)
-  (write-uuid data-output stream-id)
-  (nippy/freeze-to-out! data-output offset))
+(nippy/extend-freeze StreamRequest 3 [^StreamRequest obj data-output]
+  (let [{:keys [^UUID app-id ^UUID stream-id ^long offset]} obj]
+    (write-uuid data-output app-id)
+    (write-uuid data-output stream-id)
+    (nippy/freeze-to-out! data-output offset)))
 
 (nippy/extend-thaw 3 [data-input]
   (instant.grpc/->StreamRequest (read-uuid data-input)
@@ -109,13 +107,13 @@
     (doseq [^bytes chunk chunks]
       (.write data-output chunk))))
 
-(nippy/extend-freeze StreamInit 5 [^StreamInit {:keys [^long offset files chunks]}
-                                   data-output]
-  (nippy/freeze-to-out! data-output offset)
-  (nippy/freeze-to-out! data-output (count files))
-  (doseq [file files]
-    (write-file file data-output))
-  (write-chunks data-output chunks))
+(nippy/extend-freeze StreamInit 5 [^StreamInit obj data-output]
+  (let [{:keys [^long offset files chunks]} obj]
+    (nippy/freeze-to-out! data-output offset)
+    (nippy/freeze-to-out! data-output (count files))
+    (doseq [file files]
+      (write-file file data-output))
+    (write-chunks data-output chunks)))
 
 (defn read-chunks [^DataInput data-input]
   (let [byte-len (nippy/thaw-from-in! data-input)]
@@ -136,10 +134,9 @@
 
 ;; 6 is our custom identifier for StreamContent, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze StreamContent 6 [^StreamContent {:keys [offset chunks]}
-                                      data-output]
-  (nippy/freeze-to-out! data-output offset)
-  (write-chunks data-output chunks))
+(nippy/extend-freeze StreamContent 6 [^StreamContent obj data-output]
+  (nippy/freeze-to-out! data-output (:offset obj))
+  (write-chunks data-output (:chunks obj)))
 
 (nippy/extend-thaw 6 [data-input]
   (let [offset (nippy/thaw-from-in! data-input)
@@ -148,8 +145,8 @@
 
 ;; 7 is our custom identifier for StreamError, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze StreamError 7 [^StreamError {:keys [error]} data-output]
-  (nippy/freeze-to-out! data-output (get instant.grpc/stream-error-map error -1)))
+(nippy/extend-freeze StreamError 7 [^StreamError obj data-output]
+  (nippy/freeze-to-out! data-output (get instant.grpc/stream-error-map (:error obj) -1)))
 
 (nippy/extend-thaw 7 [data-input]
   (let [error-id (nippy/thaw-from-in! data-input)
@@ -158,15 +155,15 @@
 
 ;; 8 is our custom identifier for StreamComplete, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze StreamComplete 8 [^StreamComplete _ _data-output])
+(nippy/extend-freeze StreamComplete 8 [^StreamComplete _obj _data-output])
 
 (nippy/extend-thaw 8 [_data-input]
   (instant.grpc/->StreamComplete))
 
 ;; 9 is our custom identifier for StreamAborted, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze StreamAborted 9 [^StreamAborted {:keys [abort-reason]} data-output]
-  (nippy/freeze-to-out! data-output abort-reason))
+(nippy/extend-freeze StreamAborted 9 [^StreamAborted obj data-output]
+  (nippy/freeze-to-out! data-output (:abort-reason obj)))
 
 (nippy/extend-thaw 9 [data-input]
   (instant.grpc/->StreamAborted (nippy/thaw-from-in! data-input)))
@@ -209,32 +206,32 @@
 
 ;; 12 is our custom identifier for WalRecord, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze WalRecord 12 [^WalRecord {:keys [^UUID app-id
-                                                      ^long tx-id
-                                                      ^ISN isn
-                                                      ^ISN previous-isn
-                                                      ^Instant tx-created-at
-                                                      ^long tx-bytes
-                                                      ^LogSequenceNumber nextlsn
-                                                      attr-changes
-                                                      ident-changes
-                                                      triple-changes
-                                                      messages
-                                                      wal-logs]}
-                                   data-output]
-  (nippy/with-cache
-    (write-uuid data-output app-id)
-    (nippy/freeze-to-out! data-output tx-id)
-    (nippy/freeze-to-out! data-output isn)
-    (nippy/freeze-to-out! data-output previous-isn)
-    (nippy/freeze-to-out! data-output tx-created-at)
-    (nippy/freeze-to-out! data-output tx-bytes)
-    (nippy/freeze-to-out! data-output nextlsn)
-    (nippy/freeze-to-out! data-output attr-changes)
-    (nippy/freeze-to-out! data-output ident-changes)
-    (nippy/freeze-to-out! data-output triple-changes)
-    (nippy/freeze-to-out! data-output messages)
-    (nippy/freeze-to-out! data-output wal-logs)))
+(nippy/extend-freeze WalRecord 12 [^WalRecord obj data-output]
+  (let [{:keys [^UUID app-id
+                ^long tx-id
+                ^ISN isn
+                ^ISN previous-isn
+                ^Instant tx-created-at
+                ^long tx-bytes
+                ^LogSequenceNumber nextlsn
+                attr-changes
+                ident-changes
+                triple-changes
+                messages
+                wal-logs]} obj]
+    (nippy/with-cache
+      (write-uuid data-output app-id)
+      (nippy/freeze-to-out! data-output tx-id)
+      (nippy/freeze-to-out! data-output isn)
+      (nippy/freeze-to-out! data-output previous-isn)
+      (nippy/freeze-to-out! data-output tx-created-at)
+      (nippy/freeze-to-out! data-output tx-bytes)
+      (nippy/freeze-to-out! data-output nextlsn)
+      (nippy/freeze-to-out! data-output attr-changes)
+      (nippy/freeze-to-out! data-output ident-changes)
+      (nippy/freeze-to-out! data-output triple-changes)
+      (nippy/freeze-to-out! data-output messages)
+      (nippy/freeze-to-out! data-output wal-logs))))
 
 (nippy/extend-thaw 12 [data-input]
   (nippy/with-cache
@@ -253,7 +250,7 @@
 
 ;; 13 is our custom identifier for SlotDisconnect, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze SlotDisconnect 13 [^SlotDisconnect _ _data-output])
+(nippy/extend-freeze SlotDisconnect 13 [^SlotDisconnect _obj _data-output])
 
 (nippy/extend-thaw 13 [_data-input]
   (instant.grpc/->SlotDisconnect))
@@ -268,11 +265,9 @@
 
 ;; 15 is our custom identifier for InvalidatorSubscribe, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze InvalidatorSubscribe 15 [^InvalidatorSubscribe {:keys [machine-id
-                                                                            process-id]}
-                                              data-output]
-  (write-uuid data-output machine-id)
-  (nippy/freeze-to-out! data-output process-id))
+(nippy/extend-freeze InvalidatorSubscribe 15 [^InvalidatorSubscribe obj data-output]
+  (write-uuid data-output (:machine-id obj))
+  (nippy/freeze-to-out! data-output (:process-id obj)))
 
 (nippy/extend-thaw 15 [data-input]
   (instant.grpc/->InvalidatorSubscribe (read-uuid data-input)
@@ -280,13 +275,13 @@
 
 ;; 16 is our custom identifier for WebhookEvents, no other type can use it and
 ;; it must be the same across all machines.
-(nippy/extend-freeze WebhookEvents 16 [^WebhookEvents {:keys [event-primary-keys]}
-                                       data-output]
-  (nippy/freeze-to-out! data-output (count event-primary-keys))
-  (doseq [{:keys [webhook_id isn partition_bucket]} event-primary-keys]
-    (write-uuid data-output webhook_id)
-    (write-isn isn data-output)
-    (nippy/freeze-to-out! data-output partition_bucket)))
+(nippy/extend-freeze WebhookEvents 16 [^WebhookEvents obj data-output]
+  (let [{:keys [event-primary-keys]} obj]
+    (nippy/freeze-to-out! data-output (count event-primary-keys))
+    (doseq [{:keys [webhook_id isn partition_bucket]} event-primary-keys]
+      (write-uuid data-output webhook_id)
+      (write-isn isn data-output)
+      (nippy/freeze-to-out! data-output partition_bucket))))
 
 (nippy/extend-thaw 16 [data-input]
   (let [key-count (nippy/thaw-from-in! data-input)]

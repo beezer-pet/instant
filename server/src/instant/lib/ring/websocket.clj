@@ -211,9 +211,15 @@
          (.set (.getReceiveSetter channel) listener)
          (.resumeReceives channel))))))
 
+(def ^:private max-deflate-buffer-size
+  "Undertow closes the socket on a message that needs a larger buffer to be
+   compressed or decompressed. Its default of 1 MB is less than the result of a
+   large query."
+  Integer/MAX_VALUE)
+
 (defn ws-request [^HttpServerExchange exchange ^IPersistentMap headers ^WebSocketConnectionCallback callback]
   (let [handler (->  (WebSocketProtocolHandshakeHandler. callback)
-                     (.addExtension (PerMessageDeflateHandshake. true 6)))]
+                     (.addExtension (PerMessageDeflateHandshake. true 6 true true max-deflate-buffer-size)))]
     (when headers
       (set-headers (.getResponseHeaders exchange) headers))
     (.handleRequest handler exchange)))
