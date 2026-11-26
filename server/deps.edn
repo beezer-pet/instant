@@ -130,7 +130,7 @@
                               io.github.tonsky/zprint       {:mvn/version "1.2.10"}
                               com.squareup.okhttp3/mockwebserver3 {:mvn/version "5.5.1"}
                               virgil/virgil {:mvn/version "0.5.1"}
-                              ;; asm deps add support for Java 26 (can remove once virgil updates)
+                              ;; asm deps add support for Java 27 and 28 (can remove once virgil updates)
                               org.ow2.asm/asm {:mvn/version "9.11.1"}
                               org.ow2.asm/asm-tree {:mvn/version "9.11.1"}}
                  :jvm-opts ["-XX:+UseZGC"

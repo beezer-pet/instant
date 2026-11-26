@@ -1,20 +1,11 @@
-Builds the image for postgres that is used in the local docker compose setup and in CI.
+Builds the Postgres image that the local docker compose setups, the self-hosting compose files and CI use: Postgres with pg_hint_plan and wal2json, at the versions the Dockerfile's `ARG`s name.
 
-Log in to GitHub's container registry:
+`.github/workflows/beezer-postgres.yml` publishes it as `ghcr.io/beezer-pet/postgresql:<PG_VERSION>` for amd64 and arm64 when the Dockerfile changes on `self-hosted`, or when it is run by hand. A new Postgres version is a new `PG_VERSION` in the Dockerfile and the same tag in the compose files and in `.github/workflows/clojure.yml`.
 
-[Check the docs to see if GitHub has improved the signin process](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
-
-1. Create a new personal access token (classic) with the write:packages scope
-2. Save your personal access token (classic). We recommend saving your token as an environment variable.
-```bash
-export CR_PAT=YOUR_TOKEN
-```
-3. Sign in to the Container registry service at ghcr.io.
-```bash
-echo $CR_PAT | docker login ghcr.io -u USERNAME --password-stdin
-```
-Build and push the image:
+A local build:
 
 ```sh
-make build-and-push-image
+make build-image
 ```
+
+Postgres 18 keeps its data under `/var/lib/postgresql/18/docker`, so a volume is mounted at `/var/lib/postgresql`. Data of an older major version is not read by it: it is moved over by a dump and a restore (`self-hosting/UPGRADE_DB.md`).

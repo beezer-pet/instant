@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/compose-spec/compose-go/master/schema/compose-spec.json
 services:
   postgres:
-    image: ghcr.io/instantdb/postgresql:postgresql-17-pg-hint-plan
+    image: ghcr.io/beezer-pet/postgresql:18.7
     ports:
       - "8890:5432"
     environment:
@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-instant}
       POSTGRES_DB: ${POSTGRES_DB:-instant}
     volumes:
-      - "backend-db:/var/lib/postgresql/data"
+      - "backend-db:/var/lib/postgresql"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-instant}"]
       interval: 10s
@@ -29,6 +29,8 @@ services:
       - "max_wal_senders=10"
       - "-c"
       - "shared_preload_libraries=pg_hint_plan"
+      - "-c"
+      - "output_plugin_libraries=pgoutput,test_decoding,wal2json"
       - "-c"
       - "random_page_cost=1.1"
   www:
