@@ -448,8 +448,12 @@
 
         q {:with (concat
                   (when (seq lookup-refs)
+                    ;; Materialized: Postgres 18 makes a one-row VALUES constants and then
+                    ;; evaluates triples_extract_uuid_value of a value that is no uuid,
+                    ;; though the CASE around it does not choose it.
                     [[['input-lookup-refs {:columns ['app-id 'attr-id 'value]}]
-                      {:values input-lookup-refs}]
+                      {:values input-lookup-refs}
+                      :materialized]
                      ['enhanced-lookup-refs enhanced-lookup-refs]
                      ['lookup-ref-inserts lookup-ref-inserts]
                      ['lookup-ref-lookups lookup-ref-lookups]])
@@ -787,7 +791,10 @@
 
          query {:with (concat
                        (when (seq lookup-refs)
-                         [[['input-lookup-refs {:columns ['app-id 'attr-id 'value]}] {:values input-lookup-refs}]
+                         ;; Materialized: Postgres 18 makes a one-row VALUES constants and then
+                         ;; evaluates triples_extract_uuid_value of a value that is no uuid,
+                         ;; though the CASE around it does not choose it.
+                         [[['input-lookup-refs {:columns ['app-id 'attr-id 'value]}] {:values input-lookup-refs} :materialized]
                           ['enhanced-lookup-refs enhanced-lookup-refs]
                           ['lookup-ref-inserts   lookup-ref-inserts]
                           ['lookup-ref-lookups   lookup-ref-lookups]])
@@ -1170,7 +1177,10 @@
 
         query {:with (concat
                       (when (seq lookup-refs)
-                        [[['input-lookup-refs {:columns ['app-id 'attr-id 'value]}] {:values input-lookup-refs}]
+                        ;; Materialized: Postgres 18 makes a one-row VALUES constants and then
+                        ;; evaluates triples_extract_uuid_value of a value that is no uuid,
+                        ;; though the CASE around it does not choose it.
+                        [[['input-lookup-refs {:columns ['app-id 'attr-id 'value]}] {:values input-lookup-refs} :materialized]
                          ['enhanced-lookup-refs enhanced-lookup-refs]
                          ['lookup-ref-inserts   lookup-ref-inserts]
                          ['lookup-ref-lookups   lookup-ref-lookups]])
